@@ -44,12 +44,22 @@ def generate_contours(
         cumsum = np.cumsum(sorted_density)
         cumsum_norm = cumsum / (cumsum[-1] + 1e-10)
 
-        threshold_idx = np.searchsorted(cumsum_norm[::-1], level)
-        if threshold_idx < len(sorted_density):
-            threshold = sorted_density[threshold_idx]
-        else:
-            logger.warning(f"Cannot find density level {level}")
-            continue
+        threshold_idx = int(
+            np.searchsorted(
+                cumsum_norm,
+                level,
+                side="left",
+            )
+        )
+
+        threshold_idx = min(
+            threshold_idx,
+            len(sorted_density) - 1,
+        )
+
+        threshold = sorted_density[
+            threshold_idx
+        ]
 
         # Find contours
         contours = find_contours(density, threshold)
@@ -60,14 +70,33 @@ def generate_contours(
 
             # Convert contour indices to lat/lon
             contour_coords = []
-            for idx in contour:
-                lat_idx = int(idx[0])
-                lon_idx = int(idx[1])
+        for idx in contour:
+            lat_index = float(idx[0])
+            lon_index = float(idx[1])
 
-                if 0 <= lat_idx < len(lats) and 0 <= lon_idx < len(lon):
-                    lat = lats[lat_idx]
-                    lon_val = lon[lon_idx]
-                    contour_coords.append((lon_val, lat))
+            if (
+                    0.0 <= lat_index <= len(lats) - 1
+                    and 0.0 <= lon_index <= len(lon) - 1
+                ):
+                    lat_value = float(
+                        np.interp(
+                            lat_index,
+                            np.arange(len(lats)),
+                            lats,
+                        )
+                    )
+
+                    lon_value = float(
+                        np.interp(
+                            lon_index,
+                            np.arange(len(lon)),
+                            lon,
+                        )
+                    )
+
+                    contour_coords.append(
+                        (lon_value, lat_value)
+                    )
 
             if len(contour_coords) >= 3:
                 try:
