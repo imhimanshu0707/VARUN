@@ -578,14 +578,17 @@ def cli_main() -> None:
 
     parser.add_argument(
         "--current-file",
-        required=True,
         help="Path to ocean current NetCDF",
     )
 
     parser.add_argument(
         "--wind-file",
-        required=True,
         help="Path to wind NetCDF",
+    )
+
+    parser.add_argument(
+        "--combined-file",
+        help="Path to combined current and wind NetCDF",
     )
 
     parser.add_argument(
@@ -603,6 +606,18 @@ def cli_main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.combined_file:
+        if args.current_file or args.wind_file:
+            parser.error(
+                "--combined-file cannot be used with "
+                "--current-file or --wind-file"
+            )
+    elif not args.current_file or not args.wind_file:
+        parser.error(
+            "Provide either --combined-file, or both "
+            "--current-file and --wind-file"
+        )
 
     # ---------------------------------------------------------
     # Load spill polygon from actual GeoJSON file
@@ -691,6 +706,7 @@ def cli_main() -> None:
     print(f"Polygon bounds:   {polygon_geometry.bounds}")
     print(f"Current file:     {args.current_file}")
     print(f"Wind file:        {args.wind_file}")
+    print(f"Combined file:    {args.combined_file}")
     print(f"Particles:        {args.particles}")
     print(f"Forecast hours:   {args.forecast_hours}")
     print("=" * 70 + "\n")
@@ -708,8 +724,21 @@ def cli_main() -> None:
     # ---------------------------------------------------------
 
     forcing_config = ForcingConfig(
-        current_file=Path(args.current_file),
-        wind_file=Path(args.wind_file),
+        current_file=(
+            Path(args.current_file)
+            if args.current_file
+            else None
+        ),
+        wind_file=(
+            Path(args.wind_file)
+            if args.wind_file
+            else None
+        ),
+        combined_file=(
+            Path(args.combined_file)
+            if args.combined_file
+            else None
+        ),
     )
 
     runner = Phase2CompleteRunner()
