@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 CURRENT_U_NAMES = {
     "uo",
     "eastward_sea_water_velocity",
+    "x_sea_water_velocity",
     "current_u",
     "u_current",
 }
@@ -42,6 +43,7 @@ CURRENT_U_NAMES = {
 CURRENT_V_NAMES = {
     "vo",
     "northward_sea_water_velocity",
+    "y_sea_water_velocity",
     "current_v",
     "v_current",
 }
@@ -49,6 +51,7 @@ CURRENT_V_NAMES = {
 WIND_U_NAMES = {
     "u10",
     "10u",
+    "x_wind",
     "eastward_wind",
     "eastward_wind_at_10m",
 }
@@ -56,6 +59,7 @@ WIND_U_NAMES = {
 WIND_V_NAMES = {
     "v10",
     "10v",
+    "y_wind",
     "northward_wind",
     "northward_wind_at_10m",
 }
