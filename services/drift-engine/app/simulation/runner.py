@@ -544,8 +544,7 @@ class Phase2CompleteRunner:
             "output_dir": str(self.run_dir) if self.run_dir else None,
         }
 
-
-if __name__ == "__main__":
+def cli_main() -> None:
     import argparse
     import json
 
@@ -743,3 +742,7 @@ if __name__ == "__main__":
     raise SystemExit(
         0 if result.get("status") == "SUCCESS" else 1
     )
+
+
+if __name__ == "__main__":
+    cli_main()
