@@ -37,7 +37,11 @@ class DriftSimulationEngine:
         """Initialize the simulation engine."""
         self.o: Optional[OpenOil] = None
 
-    def _configure_openoil(self, readers: list) -> OpenOil:
+    def _configure_openoil(
+        self,
+        readers: list,
+        direction: SimulationDirection,
+    ) -> OpenOil:
         """
         Create and configure an OpenOil instance.
 
@@ -86,6 +90,24 @@ class DriftSimulationEngine:
                 )
         except Exception:
             pass
+
+        if direction == SimulationDirection.BACKWARD:
+            backward_disabled_processes = (
+                "processes:evaporation",
+                "processes:emulsification",
+                "processes:dispersion",
+                "processes:biodegradation",
+                "processes:update_oilfilm_thickness",
+                "drift:vertical_mixing",
+            )
+
+            for config_key in backward_disabled_processes:
+                oil.set_config(config_key, False)
+
+            logger.info(
+                "Configured transport-only backward simulation; "
+                "irreversible oil weathering and vertical mixing disabled."
+            )
 
         return oil
 
@@ -207,7 +229,10 @@ class DriftSimulationEngine:
                 outfile_path,
             )
 
-            self.o = self._configure_openoil(readers)
+            self.o = self._configure_openoil(
+                readers,
+                config.direction,
+            )
 
             lats_array = np.asarray(
                 config.initial_lats,
