@@ -19,13 +19,11 @@ dependencies = [
     "scipy>=1.14.0",
     "xarray>=2024.02.0",
     "netCDF4>=1.6.5",
+# Oil drift simulation
+"opendrift==1.14.11",
 
-    # Oil drift simulation
-    "opendrift==1.14.11",
-    "opendrift[extra]>=1.14.11",
-
-    # Geometry and spatial
-    "shapely>=2.0.0",
+# Geometry and spatial
+"shapely>=2.0.0",
     "geopandas>=0.14.0",
     "pyproj>=3.6.0",
 
