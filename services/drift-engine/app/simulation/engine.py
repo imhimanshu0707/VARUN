@@ -371,6 +371,25 @@ class DriftSimulationEngine:
 
         finally:
 
+            # Close any xarray dataset retained by OpenDrift before
+            # deleting its NetCDF file. This is required on Windows.
+            if self.o is not None:
+                try:
+                    result_dataset = getattr(self.o, "result", None)
+                    close_result = getattr(result_dataset, "close", None)
+
+                    if callable(close_result):
+                        close_result()
+
+                except Exception as exc:
+                    logger.warning(
+                        "Could not close OpenDrift result dataset: %s",
+                        exc,
+                    )
+
+                finally:
+                    self.o = None
+
             if outfile_path:
                 try:
                     path = Path(outfile_path)
@@ -389,9 +408,6 @@ class DriftSimulationEngine:
                         outfile_path,
                         exc,
                     )
-
-            # Release OpenOil instance
-            self.o = None
 
     def _extract_trajectory_from_file(
         self,
