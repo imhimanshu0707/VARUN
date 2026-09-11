@@ -20,6 +20,8 @@ def calculate_origin_density(
     hindcast_result: HindcastResult,
     grid_resolution_km: float = 1.0,
     sigma_km: float = 2.0,
+    release_age_hours: Optional[int] = None,
+
 ) -> Optional[xr.Dataset]:
     """
     Calculate origin density from hindcast results.
@@ -36,6 +38,10 @@ def calculate_origin_density(
 
         sigma_km:
             Gaussian filter sigma in kilometers.
+
+        release_age_hours:
+            Optional candidate age to calculate separately.
+            If None, all successful ages are aggregated.
 
     Returns:
         xarray Dataset with density grid,
@@ -55,6 +61,13 @@ def calculate_origin_density(
     all_lons = []
 
     for release_age in hindcast_result.release_ages:
+
+        if (
+            release_age_hours is not None
+            and release_age.release_age_hours != release_age_hours
+        ):
+
+            continue
 
         if release_age.simulation_result is None:
             continue
@@ -291,6 +304,13 @@ def calculate_origin_density(
         "gaussian_sigma_km"
     ] = sigma_km
 
+    ds.attrs[
+        "release_age_hours"
+    ] = (
+        release_age_hours
+        if release_age_hours is not None
+        else "all"
+    )
     logger.info(
         "Origin density calculated successfully"
     )
