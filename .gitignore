@@ -86,3 +86,5 @@ Thumbs.db
 repo-tree.txt
 artifacts/reproducibility/
 services/drift-engine/outputs/
+# Phase-1 runtime inference artifacts
+/outputs/
