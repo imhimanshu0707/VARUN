@@ -475,6 +475,9 @@ if (
   process.env.PHASE1_DEMO_IMAGE_PATH ??
   'data/fixtures/images/synthetic_spill.tif',
 
+  imageWidth: 512,
+  imageHeight: 512,
+
   tileSize: 512,
   overlap: 64,
 
