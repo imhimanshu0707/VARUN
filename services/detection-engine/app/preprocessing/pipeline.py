@@ -1,49 +1,95 @@
 from typing import Any
+
 import numpy as np
 import torch
 
 
-def preprocess_image(image: Any) -> torch.Tensor:
+LOWER_PERCENTILE = 2.0
+UPPER_PERCENTILE = 98.0
+EXPECTED_CHANNELS = 2
+
+
+def _to_channel_first(image: Any) -> np.ndarray:
+    """
+    Convert the input into a strict (2, height, width) float32 array.
+    """
+
     if isinstance(image, torch.Tensor):
-        tensor = image.float()
+        array = image.detach().cpu().numpy()
     else:
-        tensor = torch.as_tensor(
-            np.asarray(image),
-            dtype=torch.float32,
+        array = np.asarray(image)
+
+    if array.ndim != 3:
+        raise ValueError(
+            "Expected a 3D two-band SAR image with shape "
+            f"(2,H,W) or (H,W,2), got {array.shape}"
         )
 
-    if tensor.ndim == 2:
-        tensor = tensor.unsqueeze(0).repeat(2, 1, 1)
-
-    elif tensor.ndim == 3:
-        if tensor.shape[0] == 2:
-            pass
-        elif tensor.shape[-1] == 2:
-            tensor = tensor.permute(2, 0, 1)
-        elif tensor.shape[0] == 1:
-            tensor = tensor.repeat(2, 1, 1)
-        elif tensor.shape[-1] == 1:
-            tensor = tensor.permute(2, 0, 1).repeat(2, 1, 1)
-        else:
-            tensor = tensor[:2]
-
-    elif tensor.ndim == 4:
-        if tensor.shape[1] != 2:
-            raise ValueError(
-                f"Expected 2 channels, got {tensor.shape[1]}"
-            )
-        return tensor
-
+    if array.shape[0] == EXPECTED_CHANNELS:
+        channel_first = array
+    elif array.shape[-1] == EXPECTED_CHANNELS:
+        channel_first = np.moveaxis(array, -1, 0)
     else:
         raise ValueError(
-            f"Unsupported image shape: {tuple(tensor.shape)}"
+            "Phase-1 U-Net requires exactly two SAR bands "
+            f"(VV and VH), got shape {array.shape}"
         )
 
-    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.ascontiguousarray(
+        channel_first,
+        dtype=np.float32,
+    )
 
-    minimum = tensor.amin(dim=(-2, -1), keepdim=True)
-    maximum = tensor.amax(dim=(-2, -1), keepdim=True)
 
-    tensor = (tensor - minimum) / (maximum - minimum + 1e-8)
+def preprocess_image(
+    image: Any,
+    lower_percentile: float = LOWER_PERCENTILE,
+    upper_percentile: float = UPPER_PERCENTILE,
+) -> torch.Tensor:
+    """
+    Apply per-band global percentile normalization.
 
-    return tensor
+    This matches the Phase-1 training preprocessing profile:
+    sar-percentile-v1.
+
+    Each SAR band is independently clipped between its 2nd and
+    98th percentiles and scaled into the [0, 1] range.
+    """
+
+    if not 0.0 <= lower_percentile < upper_percentile <= 100.0:
+        raise ValueError(
+            "Percentiles must satisfy "
+            "0 <= lower < upper <= 100"
+        )
+
+    array = _to_channel_first(image)
+    normalized = np.zeros_like(array, dtype=np.float32)
+
+    for band_index in range(EXPECTED_CHANNELS):
+        band = array[band_index]
+        valid = np.isfinite(band)
+
+        if not np.any(valid):
+            raise ValueError(
+                f"SAR band {band_index + 1} contains no finite values"
+            )
+
+        low, high = np.percentile(
+            band[valid],
+            [lower_percentile, upper_percentile],
+        )
+
+        if high <= low:
+            normalized[band_index] = 0.0
+            continue
+
+        scaled = (band - low) / (high - low)
+        scaled = np.clip(scaled, 0.0, 1.0)
+        scaled[~valid] = 0.0
+
+        normalized[band_index] = scaled.astype(
+            np.float32,
+            copy=False,
+        )
+
+    return torch.from_numpy(normalized)
