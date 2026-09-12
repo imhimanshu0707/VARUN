@@ -9,10 +9,58 @@ export interface Phase1EngineDetection {
   label: string;
 }
 
+export interface Phase1Centroid {
+  longitude: number;
+  latitude: number;
+}
+
+export interface Phase1Geometry {
+  type: 'Polygon' | 'MultiPolygon';
+  coordinates: unknown;
+}
+
+export interface Phase1Artifacts {
+  spill_detection_geojson: string | null;
+  detection_summary_json: string | null;
+  oil_probability_tif: string | null;
+  oil_mask_tif: string | null;
+  preview_png: string | null;
+}
+
 export interface Phase1EngineResult {
+  contract_version: 'phase1-to-phase2-v1';
   status: string;
+
+  case_id: string | null;
+  scene_id: string | null;
+  run_id: string | null;
+  acquisition_time_utc: string | null;
+
+  oil_detected: boolean;
+  confidence: number | null;
+  centroid: Phase1Centroid | null;
+  area_km2: number | null;
+  perimeter_km: number | null;
+
+  crs: string | null;
+  source_image: string | null;
+  geometry: Phase1Geometry | null;
+
+  model_version: string | null;
+  preprocessing_version: string | null;
+  threshold: number | null;
+  min_area_pixels: number | null;
+
   tile_count: number;
   detection_count: number;
+  oil_pixel_count: number;
+  total_pixel_count: number;
+  oil_coverage_percent: number;
+
+  image_width: number | null;
+  image_height: number | null;
+
+  artifacts: Phase1Artifacts;
   detections: Phase1EngineDetection[];
   tiles: Array<{
     x: number;
@@ -20,7 +68,7 @@ export interface Phase1EngineResult {
     width: number;
     height: number;
   }>;
-  model_version?: string | null;
+  warnings: string[];
 }
 
 @Injectable()
@@ -31,11 +79,17 @@ export class Phase1EngineClient {
 
   async infer(input: {
     imagePath: string;
-    imageWidth: number;
-    imageHeight: number;
+    imageWidth?: number;
+    imageHeight?: number;
+
+    caseId: string;
+    sceneId: string;
+    acquisitionTimeUtc: string;
+
     tileSize?: number;
     overlap?: number;
     confidenceThreshold?: number;
+    minAreaPixels?: number;
     iouThreshold?: number;
   }): Promise<Phase1EngineResult> {
     const response = await fetch(
@@ -49,10 +103,20 @@ export class Phase1EngineClient {
           image_path: input.imagePath,
           image_width: input.imageWidth,
           image_height: input.imageHeight,
+
+          contract_version:
+            'phase1-to-phase2-v1',
+          case_id: input.caseId,
+          scene_id: input.sceneId,
+          acquisition_time_utc:
+            input.acquisitionTimeUtc,
+
           tile_size: input.tileSize ?? 512,
           overlap: input.overlap ?? 64,
           confidence_threshold:
             input.confidenceThreshold ?? 0.5,
+          min_area_pixels:
+            input.minAreaPixels ?? 20,
           iou_threshold:
             input.iouThreshold ?? 0.5,
         }),
@@ -67,6 +131,18 @@ export class Phase1EngineClient {
       );
     }
 
-    return JSON.parse(text) as Phase1EngineResult;
+    const result =
+      JSON.parse(text) as Phase1EngineResult;
+
+    if (
+      result.contract_version !==
+      'phase1-to-phase2-v1'
+    ) {
+      throw new Error(
+        `UNSUPPORTED_PHASE1_CONTRACT: ${result.contract_version}`,
+      );
+    }
+
+    return result;
   }
 }

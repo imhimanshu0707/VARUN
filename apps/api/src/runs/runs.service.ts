@@ -239,6 +239,21 @@ const input = {
       ? snapshot.imageHeight
       : undefined,
 
+        caseId:
+    typeof snapshot.caseId === 'string'
+      ? snapshot.caseId
+      : dbRun.caseId,
+
+  sceneId:
+    typeof snapshot.sceneId === 'string'
+      ? snapshot.sceneId
+      : dbRun.sceneId ?? undefined,
+
+  acquisitionTimeUtc:
+    typeof snapshot.acquisitionTimeUtc === 'string'
+      ? snapshot.acquisitionTimeUtc
+      : undefined,
+
   tileSize:
     typeof snapshot.tileSize === 'number'
       ? snapshot.tileSize
@@ -258,15 +273,23 @@ const input = {
     typeof snapshot.iouThreshold === 'number'
       ? snapshot.iouThreshold
       : 0.5,
+
+  minAreaPixels:
+    typeof snapshot.minAreaPixels === 'number'
+      ? snapshot.minAreaPixels
+      : 20,
 };
 
 if (
   !input.imagePath ||
   !input.imageWidth ||
-  !input.imageHeight
+  !input.imageHeight ||
+  !input.caseId ||
+  !input.sceneId ||
+  !input.acquisitionTimeUtc
 ) {
   throw new Error(
-    'Run inputSnapshot does not contain valid imagePath, imageWidth and imageHeight',
+    'Run inputSnapshot is missing Phase-1 image or handoff metadata',
   );
 }
 
@@ -274,15 +297,23 @@ if (
 // PHASE-1 DETECTION ENGINE
 // ---------------------------------
 
-const _engineResult =
+const engineResult =
   await this.phase1Engine.infer({
     imagePath: input.imagePath,
     imageWidth: input.imageWidth,
     imageHeight: input.imageHeight,
+
+    caseId: input.caseId,
+    sceneId: input.sceneId,
+    acquisitionTimeUtc:
+      input.acquisitionTimeUtc,
+
     tileSize: input.tileSize,
     overlap: input.overlap,
     confidenceThreshold:
       input.confidenceThreshold,
+    minAreaPixels:
+      input.minAreaPixels,
     iouThreshold:
       input.iouThreshold,
   });
@@ -326,7 +357,37 @@ const _engineResult =
               safeMessage:
                 'Test run completed successfully.',
               correlationId,
-              details: {},
+              details: {
+              contractVersion:
+                engineResult.contract_version,
+              phase1EngineRunId:
+                engineResult.run_id,
+              oilDetected:
+                engineResult.oil_detected,
+              confidence:
+                engineResult.confidence,
+             artifacts: {
+  spillDetectionGeojson:
+    engineResult.artifacts
+      .spill_detection_geojson,
+
+  detectionSummaryJson:
+    engineResult.artifacts
+      .detection_summary_json,
+
+  oilProbabilityTif:
+    engineResult.artifacts
+      .oil_probability_tif,
+
+  oilMaskTif:
+    engineResult.artifacts
+      .oil_mask_tif,
+
+  previewPng:
+    engineResult.artifacts
+      .preview_png,
+},
+              },
             },
           });
 
@@ -378,16 +439,19 @@ const _engineResult =
   type: 'TEST_RUN',
   caseId,
   sceneId,
+  acquisitionTimeUtc:
+  '2026-09-02T12:00:00Z',
 
-  imagePath: 'C:/Users/akhil/projects/VARUN/data/fixtures/images/00168.tif',
-  imageWidth: 2048,
-  imageHeight: 2048,
+  imagePath:
+  process.env.PHASE1_DEMO_IMAGE_PATH ??
+  'data/fixtures/images/synthetic_spill.tif',
 
   tileSize: 512,
   overlap: 64,
 
   confidenceThreshold: 0.5,
   iouThreshold: 0.5,
+  minAreaPixels: 20,
 };
 
     const configHash = createHash('sha256')
@@ -415,8 +479,10 @@ const _engineResult =
 
         idempotencyKey,
 
-        inputContractVersion: 'v1',
-        outputContractVersion: 'v1',
+        inputContractVersion:
+         'phase1-to-phase2-v1',
+        outputContractVersion:
+         'phase1-to-phase2-v1',
 
         configHash,
         codeVersion: 'dev',
