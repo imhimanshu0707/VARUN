@@ -9,6 +9,7 @@ from app.inference.tiling import create_tiles
 from app.postprocessing.mask_to_detection import mask_to_detections
 from app.predictor.unet_predictor import UNetPredictor
 from app.preprocessing import preprocess_image
+from app.postprocessing.mask import remove_small_components
 
 
 UNET_DIVISIBILITY = 16
@@ -132,9 +133,15 @@ def run_inference(
         image_width=image_width,
     )
 
-    mask = (
-        probability_map >= confidence_threshold
+    raw_mask = (
+    probability_map >= confidence_threshold
     ).astype(np.uint8)
+
+    mask = remove_small_components(
+    mask=raw_mask,
+    min_area_pixels=min_area_pixels,
+    connectivity=8,
+)
 
     # Bounding boxes are retained only for old backend/debug clients.
     # Final geographic output will be generated from the full mask.
