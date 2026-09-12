@@ -1,5 +1,7 @@
 """Complete Phase 2 pipeline runner for VARUN drift simulation."""
 
+
+import csv
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -289,19 +291,101 @@ class Phase2CompleteRunner:
 
             # ========== Step 6: Rank Release Ages ==========
             logger.info(f"[6/9] Ranking release ages...")
-            release_scores = self._rank_release_ages(hindcast_result)
+            (
+                release_scores,
+                candidate_reconstructions,
+                candidate_origins,
+            ) = self._rank_release_ages(
+                hindcast_result=hindcast_result,
+                observation_time=observation_time,
+                spill_polygon_geojson=spill_polygon_geojson,
+                readers=readers,
+                seeding_config=seeding_config,
+            )
 
             # Save release time scores
-            scores_csv = self.run_dir / "release_time_scores.csv"
-            with open(scores_csv, "w") as f:
-                f.write("release_age_hours,release_time,status,ranking_score,rank,metric1,metric2\n")
+            scores_csv = (
+                self.run_dir / "release_time_scores.csv"
+            )
+
+            score_columns = [
+                "release_age_hours",
+                "release_time_utc",
+                "status",
+                "reconstruction_score",
+                "rank",
+                "iou",
+                "particle_coverage",
+                "centroid_error_km",
+            ]
+
+            with scores_csv.open(
+                "w",
+                encoding="utf-8",
+                newline="",
+            ) as file:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=score_columns,
+                )
+                writer.writeheader()
+
                 for age in release_ages_hours:
-                    score_info = release_scores.get(age, {})
-                    rank = score_info.get("rank", "NA")
-                    score = score_info.get("score", 0.0)
-                    status = score_info.get("status", "FAILED")
-                    release_time = score_info.get("release_time", "NA")
-                    f.write(f"{age},{release_time},{status},{score},{rank},placeholder,placeholder\n")
+                    score_info = release_scores.get(
+                        age,
+                        {},
+                    )
+                    success = (
+                        score_info.get("status")
+                        == "SUCCESS"
+                    )
+
+                    writer.writerow(
+                        {
+                            "release_age_hours": age,
+                            "release_time_utc": (
+                                score_info.get(
+                                    "release_time",
+                                    "",
+                                )
+                            ),
+                            "status": score_info.get(
+                                "status",
+                                "FAILED",
+                            ),
+                            "reconstruction_score": (
+                                score_info.get("score", "")
+                                if success
+                                else ""
+                            ),
+                            "rank": (
+                                score_info.get("rank", "")
+                                if success
+                                else ""
+                            ),
+                            "iou": (
+                                score_info.get("iou", "")
+                                if success
+                                else ""
+                            ),
+                            "particle_coverage": (
+                                score_info.get(
+                                    "particle_coverage",
+                                    "",
+                                )
+                                if success
+                                else ""
+                            ),
+                            "centroid_error_km": (
+                                score_info.get(
+                                    "centroid_error_km",
+                                    "",
+                                )
+                                if success
+                                else ""
+                            ),
+                        }
+                    )
             all_artifacts.append(("release_time_scores", str(scores_csv)))
 
             best_release_age = self._get_best_release_age(release_scores)
@@ -315,26 +399,29 @@ class Phase2CompleteRunner:
             # ========== Step 7: Run Forward Reconstruction ==========
             logger.info(f"[7/9] Running forward reconstruction...")
 
-            if density_ds is not None:
-                lat_min, lat_max, lon_min, lon_max = get_density_bounds(density_ds, level=0.9)
-                best_origin_lat = (lat_min + lat_max) / 2
-                best_origin_lon = (lon_min + lon_max) / 2
-            else:
-
-                poly = shape(spill_polygon_geojson)
-                best_origin_lon, best_origin_lat = poly.centroid.coords[0]
-
-            reconstruction_runner = ReconstructionRunner(self.engine)
-            reconstruction = reconstruction_runner.run(
-                run_id=self.run_id,
-                best_origin_lat=best_origin_lat,
-                best_origin_lon=best_origin_lon,
-                observation_time=observation_time,
-                observed_polygon_geojson=spill_polygon_geojson,
-                release_age_hours=best_release_age,
-                readers=readers,
-                seeding_config=seeding_config,
+            best_origin = candidate_origins.get(
+                best_release_age
             )
+            reconstruction = (
+                candidate_reconstructions.get(
+                    best_release_age
+                )
+            )
+
+            if best_origin is None or reconstruction is None:
+                validation_checks["reconstruction"] = {
+                    "status": "FAIL",
+                    "reason": (
+                        "Best candidate reconstruction "
+                        "was not available"
+                    ),
+                }
+                return self._create_failed_response(
+                    "Best candidate reconstruction unavailable"
+                )
+
+            best_origin_lat = best_origin["lat"]
+            best_origin_lon = best_origin["lon"]
 
             if reconstruction:
                 logger.info("✓ Reconstruction complete")
@@ -702,34 +789,154 @@ class Phase2CompleteRunner:
         validation_checks["forcing_audit"] = {"status": "PASS"}
         return forcing_audit
 
-    def _rank_release_ages(self, hindcast_result) -> dict:
-        """Rank release ages based on reconstruction (placeholder)."""
-        scores = {}
+    def _rank_release_ages(
+        self,
+        hindcast_result,
+        observation_time: datetime,
+        spill_polygon_geojson: dict,
+        readers: list,
+        seeding_config: SeedingConfig,
+    ) -> tuple[dict, dict, dict]:
+        """
+        Forward-reconstruct and rank every successful release age.
 
-        for i, ra in enumerate(hindcast_result.release_ages):
-            if ra.simulation_result is None:
-                scores[ra.release_age_hours] = {
+        Returns:
+            scores:
+                Metrics and rank for each candidate age.
+            reconstructions:
+                Successful reconstruction result by age.
+            origins:
+                Candidate origin latitude/longitude by age.
+        """
+        scores = {}
+        reconstructions = {}
+        origins = {}
+
+        reconstruction_runner = ReconstructionRunner(
+            self.engine
+        )
+
+        for release_age in hindcast_result.release_ages:
+            age_hours = release_age.release_age_hours
+            release_time = (
+                observation_time
+                - timedelta(hours=age_hours)
+            )
+
+            if release_age.simulation_result is None:
+                scores[age_hours] = {
                     "status": "FAILED",
                     "score": 0.0,
                     "rank": None,
+                    "release_time": to_iso_utc(
+                        release_time
+                    ),
+                    "reason": "hindcast_failed",
                 }
-            else:
-                # Simple ranking based on order (real implementation would use reconstruction metrics)
-                rank = i + 1
-                score = 1.0 / (rank + 1)  # Higher score for earlier rank
+                continue
 
-                release_time = hindcast_result.observation_time - timedelta(
-                    hours=ra.release_age_hours
+            try:
+                age_density = calculate_origin_density(
+                    hindcast_result,
+                    release_age_hours=age_hours,
                 )
 
-                scores[ra.release_age_hours] = {
+                if age_density is None:
+                    raise ValueError(
+                        "Origin density was not generated"
+                    )
+
+                (
+                    lat_min,
+                    lat_max,
+                    lon_min,
+                    lon_max,
+                ) = get_density_bounds(
+                    age_density,
+                    level=0.9,
+                )
+
+                origin_lat = (lat_min + lat_max) / 2
+                origin_lon = (lon_min + lon_max) / 2
+
+                reconstruction = reconstruction_runner.run(
+                    run_id=(
+                        f"{self.run_id}-{age_hours}H"
+                    ),
+                    best_origin_lat=origin_lat,
+                    best_origin_lon=origin_lon,
+                    observation_time=observation_time,
+                    observed_polygon_geojson=(
+                        spill_polygon_geojson
+                    ),
+                    release_age_hours=age_hours,
+                    readers=readers,
+                    seeding_config=seeding_config,
+                )
+
+                if reconstruction is None:
+                    raise ValueError(
+                        "Forward reconstruction failed"
+                    )
+
+                metrics = reconstruction.metrics
+
+                scores[age_hours] = {
                     "status": "SUCCESS",
-                    "score": score,
-                    "rank": rank,
-                    "release_time": to_iso_utc(release_time),
+                    "score": metrics.overall_score,
+                    "rank": None,
+                    "release_time": to_iso_utc(
+                        release_time
+                    ),
+                    "iou": metrics.overlap_score,
+                    "particle_coverage": (
+                        metrics.particle_coverage
+                    ),
+                    "centroid_error_km": (
+                        metrics.centroid_distance_km
+                    ),
                 }
 
-        return scores
+                reconstructions[age_hours] = (
+                    reconstruction
+                )
+                origins[age_hours] = {
+                    "lat": origin_lat,
+                    "lon": origin_lon,
+                }
+
+            except Exception as exc:
+                logger.exception(
+                    "Release-age evaluation failed for %sh",
+                    age_hours,
+                )
+                scores[age_hours] = {
+                    "status": "FAILED",
+                    "score": 0.0,
+                    "rank": None,
+                    "release_time": to_iso_utc(
+                        release_time
+                    ),
+                    "reason": str(exc),
+                }
+
+        successful_scores = sorted(
+            (
+                (age, info)
+                for age, info in scores.items()
+                if info["status"] == "SUCCESS"
+            ),
+            key=lambda item: item[1]["score"],
+            reverse=True,
+        )
+
+        for rank, (age, _) in enumerate(
+            successful_scores,
+            start=1,
+        ):
+            scores[age]["rank"] = rank
+
+        return scores, reconstructions, origins
 
     def _get_best_release_age(self, scores: dict) -> Optional[int]:
         """Get best release age based on scores."""

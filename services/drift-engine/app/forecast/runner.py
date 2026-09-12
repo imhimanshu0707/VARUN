@@ -4,6 +4,8 @@ import logging
 from datetime import timedelta
 from typing import Optional
 
+import numpy as np
+
 from app.reconstruction.models import ReconstructionResult
 from app.simulation.engine import DriftSimulationEngine
 from app.simulation.models import SimulationConfig, SimulationDirection, SimulationResult
@@ -42,7 +44,31 @@ class ForecastRunner:
 
         reconstruction_sim = reconstruction.simulation_result
         final_lats, final_lons = reconstruction_sim.get_final_positions()
+        valid_mask = (
+            np.isfinite(final_lats)
+            & np.isfinite(final_lons)
+        )
 
+        valid_lats = final_lats[valid_mask]
+        valid_lons = final_lons[valid_mask]
+
+        discarded_count = int(
+            len(final_lats) - len(valid_lats)
+        )
+
+        if discarded_count:
+            logger.warning(
+                "Discarded %s invalid reconstruction particles "
+                "before forecast seeding",
+                discarded_count,
+            )
+
+        if len(valid_lats) == 0:
+            logger.error(
+                "Forecast cannot start because reconstruction "
+                "has no valid final positions"
+            )
+            return None
         observation_time = reconstruction_sim.end_time
         forecast_end_time = observation_time + timedelta(hours=forecast_hours)
 
@@ -53,8 +79,8 @@ class ForecastRunner:
             direction=SimulationDirection.FORWARD,
             start_time=observation_time,
             end_time=forecast_end_time,
-            initial_lats=final_lats.tolist(),
-            initial_lons=final_lons.tolist(),
+            initial_lats=valid_lats.tolist(),
+            initial_lons=valid_lons.tolist(),
         )
 
         try:
