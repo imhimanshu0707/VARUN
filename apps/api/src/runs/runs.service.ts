@@ -450,6 +450,20 @@ const persistenceResult =
     const sceneId =
       '00000000-0000-4000-8000-000000000002';
 
+      const demoThreshold = Number(
+  process.env.PHASE1_DEMO_THRESHOLD ?? '0.5',
+);
+
+if (
+  !Number.isFinite(demoThreshold) ||
+  demoThreshold <= 0 ||
+  demoThreshold >= 1
+) {
+  throw new Error(
+    'PHASE1_DEMO_THRESHOLD must be between 0 and 1',
+  );
+}
+
     const inputSnapshot = {
   type: 'TEST_RUN',
   caseId,
@@ -464,7 +478,7 @@ const persistenceResult =
   tileSize: 512,
   overlap: 64,
 
-  confidenceThreshold: 0.5,
+  confidenceThreshold: demoThreshold,
   iouThreshold: 0.5,
   minAreaPixels: 20,
 };
