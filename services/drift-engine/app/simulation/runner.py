@@ -1,13 +1,11 @@
 """Complete Phase 2 pipeline runner for VARUN drift simulation."""
 
 import json
-import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-import json
-from shapely.geometry import shape, mapping
+from shapely.geometry import MultiPoint, mapping, shape
 from shapely.ops import unary_union
 
 import numpy as np
@@ -16,19 +14,10 @@ import xarray as xr
 from app.artifacts import (
     create_particle_positions_geojson,
     create_trajectory_geojson,
-    write_geodataframe_geojson,
     write_json_manifest,
     write_netcdf_dataset,
 )
 from app.config import Phase2Settings
-from app.contracts import (
-    Centroid,
-    Observation,
-    OriginRegion,
-    Phase2ArtifactManifest,
-    Phase2SearchWindow,
-    SearchWindow,
-)
 from app.forcing import audit_forcing_file, create_combined_readers
 from app.forcing.models import ForcingConfig
 from app.hindcast import HindcastRunner
@@ -155,6 +144,78 @@ class Phase2CompleteRunner:
                 except Exception as e:
                     logger.warning(f"Could not save hindcast {ra.release_age_hours}h: {e}")
 
+
+            backward_features = []
+
+            for release_age in successful_ages:
+                simulation_result = release_age.simulation_result
+
+                particle_indices = list(
+                    range(
+                        min(
+                            simulation_result.particle_count,
+                            200,
+                        )
+                    )
+                )
+
+                trajectory_geojson = create_trajectory_geojson(
+                    simulation_result.trajectory_lats,
+                    simulation_result.trajectory_lons,
+                    simulation_result.trajectory_times,
+                    particle_indices=particle_indices,
+                )
+
+                for feature in trajectory_geojson["features"]:
+                    feature["properties"].update(
+                        {
+                            "case_id": case_id,
+                            "phase2_run_id": self.run_id,
+                            "direction": "backward",
+                            "release_age_hours": (
+                                release_age.release_age_hours
+                            ),
+                            "detection_time_utc": to_iso_utc(
+                                observation_time
+                            ),
+                            "estimated_release_time_utc": to_iso_utc(
+                                observation_time
+                                - timedelta(
+                                    hours=release_age.release_age_hours
+                                )
+                            ),
+                        }
+                    )
+
+                backward_features.extend(
+                    trajectory_geojson["features"]
+                )
+
+            backward_tracks = {
+                "type": "FeatureCollection",
+                "features": backward_features,
+            }
+
+            backward_tracks_file = (
+                self.run_dir / "backward_tracks.geojson"
+            )
+
+            with backward_tracks_file.open(
+                "w",
+                encoding="utf-8",
+            ) as file:
+                json.dump(
+                    backward_tracks,
+                    file,
+                    indent=2,
+                )
+
+            all_artifacts.append(
+                (
+                    "backward_tracks",
+                    str(backward_tracks_file),
+                )
+            )
             # ========== Step 4: Calculate Origin Density ==========
             logger.info(f"[4/9] Calculating origin density...")
             density_ds = calculate_origin_density(hindcast_result)
@@ -184,11 +245,43 @@ class Phase2CompleteRunner:
                         levels=[level],
                     )
                     if contours_gdf is not None and len(contours_gdf) > 0:
-                        filename = f"origin_{int(level*100)}.geojson"
-                        contours_file = self.run_dir / "origin" / filename
-                        write_geodataframe_geojson(contours_gdf, contours_file)
-                        all_artifacts.append(("origin_contours", str(contours_file)))
-                        logger.info(f"✓ Generated {level*100:.0f}% contours")
+                        density_percent = int(level * 100)
+                        filename = f"origin_{density_percent}.geojson"
+                        contours_file = self.run_dir / filename
+
+                        merged_geometry = unary_union(
+                            contours_gdf.geometry.tolist()
+                        )
+
+                        contour_feature = {
+                            "type": "Feature",
+                            "properties": {
+                                "case_id": case_id,
+                                "phase2_run_id": self.run_id,
+                                "density_level": density_percent,
+                                "contour_level": level,
+                                "semantics": "ENSEMBLE_DENSITY_REGION",
+                            },
+                            "geometry": mapping(merged_geometry),
+                        }
+
+                        with contours_file.open(
+                            "w",
+                            encoding="utf-8",
+                        ) as file:
+                            json.dump(
+                                contour_feature,
+                                file,
+                                indent=2,
+                            )
+
+                        all_artifacts.append(
+                            ("origin_contours", str(contours_file))
+                        )
+                        logger.info(
+                            "Generated %.0f%% origin contour",
+                            level * 100,
+                        )
 
                 validation_checks["origin_contours"] = {"status": "PASS"}
             else:
@@ -227,7 +320,7 @@ class Phase2CompleteRunner:
                 best_origin_lat = (lat_min + lat_max) / 2
                 best_origin_lon = (lon_min + lon_max) / 2
             else:
-                from shapely.geometry import shape
+
                 poly = shape(spill_polygon_geojson)
                 best_origin_lon, best_origin_lat = poly.centroid.coords[0]
 
@@ -259,16 +352,78 @@ class Phase2CompleteRunner:
                 write_netcdf_dataset(ds_recon, recon_file)
                 all_artifacts.append(("reconstruction", str(recon_file)))
 
-                # Create reconstruction GeoJSON
-                final_lats, final_lons = reconstruction.simulation_result.get_final_positions()
-                recon_geojson = create_particle_positions_geojson(
-                    final_lats, final_lons,
-                    properties={"scenario": "reconstruction"}
+                # Create canonical forward-reconstruction GeoJSON.
+                final_lats, final_lons = (
+                    reconstruction.simulation_result.get_final_positions()
                 )
-                recon_geojson_file = self.run_dir / "reconstruction" / "reconstruction.geojson"
-                with open(recon_geojson_file, "w") as f:
-                    json.dump(recon_geojson, f)
-                all_artifacts.append(("reconstruction_geojson", str(recon_geojson_file)))
+
+                valid_positions = [
+                    (float(lon), float(lat))
+                    for lat, lon in zip(final_lats, final_lons)
+                    if np.isfinite(lat) and np.isfinite(lon)
+                ]
+
+                if len(valid_positions) < 3:
+                    raise ValueError(
+                        "Forward reconstruction produced fewer than "
+                        "three valid final positions"
+                    )
+
+                reconstructed_geometry = MultiPoint(
+                    valid_positions
+                ).convex_hull
+
+                forward_reconstruction = {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "properties": {
+                                "case_id": case_id,
+                                "phase2_run_id": self.run_id,
+                                "scenario": "forward_reconstruction",
+                                "release_age_hours": best_release_age,
+                                "centroid_error_km": (
+                                    reconstruction.metrics
+                                    .centroid_distance_km
+                                ),
+                                "particle_coverage": (
+                                    reconstruction.metrics
+                                    .particle_coverage
+                                ),
+                                "consistency_score": (
+                                    reconstruction.metrics
+                                    .overall_score
+                                ),
+                            },
+                            "geometry": mapping(
+                                reconstructed_geometry
+                            ),
+                        }
+                    ],
+                }
+
+                recon_geojson_file = (
+                    self.run_dir
+                    / "forward_reconstruction.geojson"
+                )
+
+                with recon_geojson_file.open(
+                    "w",
+                    encoding="utf-8",
+                ) as file:
+                    json.dump(
+                        forward_reconstruction,
+                        file,
+                        indent=2,
+                    )
+
+                all_artifacts.append(
+                    (
+                        "forward_reconstruction",
+                        str(recon_geojson_file),
+                    )
+                )
 
                 # Save reconstruction metrics
                 metrics_file = self.run_dir / "reconstruction_metrics.json"
@@ -343,7 +498,7 @@ class Phase2CompleteRunner:
             if density_ds is not None:
                 lat_min, lat_max, lon_min, lon_max = get_density_bounds(density_ds, level=0.9)
             else:
-                from shapely.geometry import shape
+
                 poly = shape(spill_polygon_geojson)
                 bounds = poly.bounds  # (minx, miny, maxx, maxy)
                 lon_min, lat_min, lon_max, lat_max = bounds
@@ -351,38 +506,92 @@ class Phase2CompleteRunner:
             # Calculate release and search times
             release_time = observation_time - timedelta(hours=best_release_age)
 
-            search_window = SearchWindow(
-                min_lat=lat_min,
-                max_lat=lat_max,
-                min_lon=lon_min,
-                max_lon=lon_max,
-                start_time=release_time,
-                end_time=observation_time + timedelta(hours=forecast_hours),
+            successful_age_values = [
+                release_age.release_age_hours
+                for release_age in successful_ages
+            ]
+
+            release_window_start = (
+                observation_time
+                - timedelta(hours=max(successful_age_values))
+            )
+            release_window_end = (
+                observation_time
+                - timedelta(hours=min(successful_age_values))
             )
 
-            # Extract just the paths from all_artifacts (which are tuples of (type, path))
-            artifact_paths = [str(path) for _, path in all_artifacts]
+            observed_geometry = shape(
+                spill_polygon_geojson
+            )
+            observed_centroid = observed_geometry.centroid
 
-            phase3_contract = Phase2SearchWindow(
-                case_id=case_id,
-                scene_id=scene_id,
-                generated_at=datetime.utcnow(),
-                observation=Observation(acquired_at=observation_time),
-                best_release_age_hours=best_release_age,
-                origin=OriginRegion(
-                    centroid=Centroid(lon=best_origin_lon, lat=best_origin_lat),
-                    radius_km=self.settings.seed_buffer_km,
+            search_region_geometry = {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [lon_min, lat_min],
+                        [lon_max, lat_min],
+                        [lon_max, lat_max],
+                        [lon_min, lat_max],
+                        [lon_min, lat_min],
+                    ]
+                ],
+            }
+
+            hindcast_corridor_geometry = {
+                "type": "LineString",
+                "coordinates": [
+                    [best_origin_lon, best_origin_lat],
+                    [
+                        float(observed_centroid.x),
+                        float(observed_centroid.y),
+                    ],
+                ],
+            }
+
+            search_window_payload = {
+                "contract_version": "phase2-to-phase3-v1",
+                "case_id": case_id,
+                "phase2_run_id": self.run_id,
+                "detection_time_utc": to_iso_utc(
+                    observation_time
                 ),
-                search_window=search_window,
-                forecast=None,
-                artifacts=artifact_paths,
-                random_seed=self.settings.random_seed,
-                phase2_run_id=self.run_id,
+                "crs": "EPSG:4326",
+                "release_window": {
+                    "start_utc": to_iso_utc(
+                        release_window_start
+                    ),
+                    "end_utc": to_iso_utc(
+                        release_window_end
+                    ),
+                    "time_buffer_minutes": 60,
+                },
+                "search_region": {
+                    "geometry": search_region_geometry,
+                    "spatial_buffer_m": (
+                        self.settings.seed_buffer_km * 1000.0
+                    ),
+                },
+                "hindcast_corridor": {
+                    "geometry": hindcast_corridor_geometry,
+                    "direction_deg": None,
+                    "time_bands": [],
+                },
+            }
+
+            search_window_file = (
+                self.run_dir / "search_window.json"
             )
 
-            search_window_file = self.run_dir / "search_window.json"
-            with open(search_window_file, "w") as f:
-                json.dump(phase3_contract.dict(), f, indent=2, default=str)
+            with search_window_file.open(
+                "w",
+                encoding="utf-8",
+            ) as file:
+                json.dump(
+                    search_window_payload,
+                    file,
+                    indent=2,
+                )
             all_artifacts.append(("search_window", str(search_window_file)))
 
             validation_checks["search_window"] = {"status": "PASS"}

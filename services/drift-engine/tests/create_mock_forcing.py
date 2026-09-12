@@ -69,6 +69,14 @@ def main():
         dtype=np.float32,
     )
 
+    # Synthetic ocean-only land mask.
+    # 0 = water; this avoids loading the large global GSHHG
+    # landmask during controlled synthetic tests.
+    land_mask = np.zeros(
+        (len(lat), len(lon)),
+        dtype=np.int8,
+    )
+
     # ---------------------------------------------------------
     # Dataset
     # ---------------------------------------------------------
@@ -125,6 +133,18 @@ def main():
                     "standard_name": "sea_surface_wave_significant_height",
                     "units": "m",
                     "long_name": "Significant wave height",
+                },
+            ),
+
+            "land_binary_mask": (
+                ("latitude", "longitude"),
+                land_mask,
+                {
+                    "standard_name": "land_binary_mask",
+                    "units": "1",
+                    "long_name": (
+                        "Synthetic ocean-only binary land mask"
+                    ),
                 },
             ),
         },
