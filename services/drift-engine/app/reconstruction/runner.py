@@ -6,6 +6,8 @@ from typing import Optional
 
 import numpy as np
 
+from shapely.geometry import MultiPoint, Point, shape
+
 from app.reconstruction.models import ReconstructionMetrics, ReconstructionResult
 from app.seeding.models import SeedingConfig
 from app.seeding.polygon import seed_from_point
@@ -21,6 +23,7 @@ def run_reconstruction(
     best_origin_lat: float,
     best_origin_lon: float,
     observation_time,
+    observed_polygon_geojson: dict,
     release_age_hours: int,
     readers: list,
     engine: DriftSimulationEngine,
@@ -35,6 +38,7 @@ def run_reconstruction(
         best_origin_lat: Latitude of estimated origin
         best_origin_lon: Longitude of estimated origin
         observation_time: Time of observation
+        observed_polygon_geojson: Detected spill polygon GeoJSON
         release_age_hours: Best release age in hours
         readers: OpenDrift readers
         engine: Simulation engine
@@ -82,15 +86,88 @@ def run_reconstruction(
         logger.error(f"Reconstruction simulation failed: {e}")
         return None
 
-    # Calculate metrics
+    # Calculate reconstruction metrics against detected spill.
     final_lats, final_lons = sim_result.get_final_positions()
 
-    # Placeholder metrics - would be extended
+    valid_positions = [
+        (float(lon), float(lat))
+        for lat, lon in zip(final_lats, final_lons)
+        if np.isfinite(lat) and np.isfinite(lon)
+    ]
+
+    if not valid_positions:
+        logger.error(
+            "Reconstruction produced no valid final positions"
+        )
+        return None
+
+    observed_geometry_data = observed_polygon_geojson.get(
+        "geometry",
+        observed_polygon_geojson,
+    )
+    observed_geometry = shape(observed_geometry_data)
+
+    if observed_geometry.is_empty:
+        logger.error("Observed spill polygon is empty")
+        return None
+
+    reconstructed_geometry = MultiPoint(
+        valid_positions
+    ).convex_hull
+
+    reconstructed_centroid = reconstructed_geometry.centroid
+    observed_centroid = observed_geometry.centroid
+
+    centroid_distance_km = haversine_distance(
+        float(reconstructed_centroid.y),
+        float(reconstructed_centroid.x),
+        float(observed_centroid.y),
+        float(observed_centroid.x),
+    )
+
+    particles_inside = sum(
+        observed_geometry.covers(Point(lon, lat))
+        for lon, lat in valid_positions
+    )
+    particle_coverage = (
+        particles_inside / len(valid_positions)
+    )
+
+    union_area = reconstructed_geometry.union(
+        observed_geometry
+    ).area
+    intersection_area = reconstructed_geometry.intersection(
+        observed_geometry
+    ).area
+
+    overlap_score = (
+        intersection_area / union_area
+        if union_area > 0
+        else 0.0
+    )
+
+    distance_scale_km = max(radius_km, 1.0)
+    distance_score = float(
+        np.exp(
+            -centroid_distance_km / distance_scale_km
+        )
+    )
+
+    overall_score = float(
+        np.clip(
+            (0.40 * overlap_score)
+            + (0.35 * particle_coverage)
+            + (0.25 * distance_score),
+            0.0,
+            1.0,
+        )
+    )
+
     metrics = ReconstructionMetrics(
-        centroid_distance_km=0.0,
-        overlap_score=0.0,
-        particle_coverage=0.0,
-        overall_score=0.0,
+        centroid_distance_km=centroid_distance_km,
+        overlap_score=overlap_score,
+        particle_coverage=particle_coverage,
+        overall_score=overall_score,
     )
 
     result = ReconstructionResult(
@@ -115,6 +192,7 @@ class ReconstructionRunner:
         best_origin_lat: float,
         best_origin_lon: float,
         observation_time,
+        observed_polygon_geojson: dict,
         release_age_hours: int,
         readers: list,
         seeding_config: SeedingConfig,
@@ -125,6 +203,7 @@ class ReconstructionRunner:
             best_origin_lat,
             best_origin_lon,
             observation_time,
+            observed_polygon_geojson,
             release_age_hours,
             readers,
             self.engine,

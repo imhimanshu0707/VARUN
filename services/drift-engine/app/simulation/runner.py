@@ -330,6 +330,7 @@ class Phase2CompleteRunner:
                 best_origin_lat=best_origin_lat,
                 best_origin_lon=best_origin_lon,
                 observation_time=observation_time,
+                observed_polygon_geojson=spill_polygon_geojson,
                 release_age_hours=best_release_age,
                 readers=readers,
                 seeding_config=seeding_config,
