@@ -8,6 +8,7 @@ import { createHash, randomUUID } from 'crypto';
 import { PgBoss } from 'pg-boss';
 import { PrismaService } from '../database/prisma.service';
 import { Phase1EngineClient } from './phase1-engine.client';
+import { Phase1ResultPersistence } from './phase1-result.persistence';
 
 export type TestRunStatus =
   | 'QUEUED'
@@ -42,6 +43,7 @@ export class RunsService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly prisma: PrismaService,
     private readonly phase1Engine: Phase1EngineClient,
+    private readonly phase1ResultPersistence: Phase1ResultPersistence,
   ) {}
   // =========================================================
   // PUBLIC ATTRIBUTION PRIVACY BOUNDARY
@@ -317,6 +319,11 @@ const engineResult =
     iouThreshold:
       input.iouThreshold,
   });
+const persistenceResult =
+     await this.phase1ResultPersistence.persist(
+    runId,
+    engineResult,
+  );
           // ---------------------------------
           // COMPLETED
           // ---------------------------------
@@ -386,6 +393,14 @@ const engineResult =
   previewPng:
     engineResult.artifacts
       .preview_png,
+},
+  persistence: {
+      phase1ResultStored:
+    persistenceResult.phase1ResultStored,
+  detectionCount:
+    persistenceResult.detectionCount,
+  artifactCount:
+    persistenceResult.artifactCount,
 },
               },
             },
