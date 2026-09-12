@@ -735,7 +735,7 @@ if (
       artifacts: artifacts.map(
         (artifact) => ({
           artifactId: artifact.id,
-          role: null,
+          role: artifact.role,
           logicalName:
             artifact.logicalName,
           artifactVersion:
@@ -870,7 +870,7 @@ if (
 
       artifacts: artifacts.map((artifact) => ({
         artifactId: artifact.id,
-        role: null,
+        role: artifact.role,
         logicalName: artifact.logicalName,
         artifactVersion: artifact.artifactVersion,
         uri: artifact.uri,
