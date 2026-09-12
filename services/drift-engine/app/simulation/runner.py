@@ -396,6 +396,113 @@ class Phase2CompleteRunner:
 
             validation_checks["release_ranking"] = {"status": "PASS", "best_age": best_release_age}
 
+            selected_density_ds = calculate_origin_density(
+                hindcast_result,
+                release_age_hours=best_release_age,
+            )
+
+            if selected_density_ds is None:
+                validation_checks["origin_density"] = {
+                    "status": "FAIL",
+                    "reason": (
+                        "Selected-age origin density "
+                        "was not generated"
+                    ),
+                }
+                return self._create_failed_response(
+                    "Selected-age origin density unavailable"
+                )
+
+            density_ds = selected_density_ds
+
+            selected_density_file = (
+                self.run_dir / "origin" / "density.nc"
+            )
+            write_netcdf_dataset(
+                density_ds,
+                selected_density_file,
+            )
+
+            validation_checks["origin_density"].update(
+                {
+                    "release_age_hours": best_release_age,
+                    "semantics": (
+                        "SELECTED_RELEASE_AGE_DENSITY"
+                    ),
+                }
+            )
+
+            selected_contour_count = 0
+
+            for level in [0.50, 0.75, 0.90]:
+                contours_gdf = generate_contours(
+                    density_ds,
+                    levels=[level],
+                )
+
+                if (
+                    contours_gdf is None
+                    or len(contours_gdf) == 0
+                ):
+                    raise ValueError(
+                        "Could not generate selected-age "
+                        f"{int(level * 100)}% contour"
+                    )
+
+                density_percent = int(level * 100)
+                merged_geometry = unary_union(
+                    contours_gdf.geometry.tolist()
+                )
+
+                contour_feature = {
+                    "type": "Feature",
+                    "properties": {
+                        "case_id": case_id,
+                        "phase2_run_id": self.run_id,
+                        "density_level": density_percent,
+                        "contour_level": level,
+                        "release_age_hours": (
+                            best_release_age
+                        ),
+                        "semantics": (
+                            "SELECTED_RELEASE_AGE_"
+                            "ENSEMBLE_DENSITY_REGION"
+                        ),
+                    },
+                    "geometry": mapping(
+                        merged_geometry
+                    ),
+                }
+
+                contour_file = (
+                    self.run_dir
+                    / f"origin_{density_percent}.geojson"
+                )
+
+                with contour_file.open(
+                    "w",
+                    encoding="utf-8",
+                ) as file:
+                    json.dump(
+                        contour_feature,
+                        file,
+                        indent=2,
+                    )
+
+                selected_contour_count += 1
+
+            validation_checks["origin_contours"] = {
+                "status": (
+                    "PASS"
+                    if selected_contour_count == 3
+                    else "FAIL"
+                ),
+                "release_age_hours": best_release_age,
+                "semantics": (
+                    "SELECTED_RELEASE_AGE_CONTOURS"
+                ),
+            }
+
             # ========== Step 7: Run Forward Reconstruction ==========
             logger.info(f"[7/9] Running forward reconstruction...")
 
@@ -594,18 +701,50 @@ class Phase2CompleteRunner:
             # Calculate release and search times
             release_time = observation_time - timedelta(hours=best_release_age)
 
-            successful_age_values = [
-                release_age.release_age_hours
-                for release_age in successful_ages
+            best_reconstruction_score = release_scores[
+                best_release_age
+            ]["score"]
+            plausible_score_floor = (
+                best_reconstruction_score * 0.80
+            )
+
+            plausible_age_values = [
+                age
+                for age, score_info
+                in release_scores.items()
+                if (
+                    score_info.get("status") == "SUCCESS"
+                    and score_info.get("rank", 999) <= 2
+                    and score_info.get("score", 0.0)
+                    >= plausible_score_floor
+                )
             ]
+
+            if not plausible_age_values:
+                plausible_age_values = [
+                    best_release_age
+                ]
 
             release_window_start = (
                 observation_time
-                - timedelta(hours=max(successful_age_values))
+                - timedelta(
+                    hours=max(plausible_age_values)
+                )
             )
             release_window_end = (
                 observation_time
-                - timedelta(hours=min(successful_age_values))
+                - timedelta(
+                    hours=min(plausible_age_values)
+                )
+            )
+
+            validation_checks["release_ranking"].update(
+                {
+                    "plausible_ages": (
+                        plausible_age_values
+                    ),
+                    "score_floor_ratio": 0.80,
+                }
             )
 
             observed_geometry = shape(
