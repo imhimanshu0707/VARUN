@@ -110,6 +110,13 @@ def test_real_inference_generates_complete_artifact_bundle(
         transform=transform,
     ) as destination:
         destination.write(image)
+        validity_mask = np.full(
+            (18, 20),
+            255,
+            dtype=np.uint8,
+        )
+        validity_mask[0, 0] = 0
+        destination.write_mask(validity_mask)
 
     fake_model_path = tmp_path / "model.pth"
     fake_model_path.write_bytes(b"fake-checkpoint")
@@ -127,6 +134,12 @@ def test_real_inference_generates_complete_artifact_bundle(
     mask[5:9, 7:12] = 1
 
     def fake_run_inference(**kwargs):
+        received_valid_mask = kwargs["valid_mask"]
+
+        assert received_valid_mask.shape == (18, 20)
+        assert received_valid_mask.dtype == np.bool_
+        assert received_valid_mask[0, 0] == np.False_
+        assert received_valid_mask[0, 1] == np.True_
         return {
             "tiles": [
                 Tile(

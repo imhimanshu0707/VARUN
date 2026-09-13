@@ -158,6 +158,9 @@ def inference(request: InferenceRequest):
                 )
 
             image = source.read().astype(np.float32)
+            valid_mask = (
+                source.dataset_mask() > 0
+            )
             image_width = source.width
             image_height = source.height
             source_crs = source.crs
@@ -199,6 +202,7 @@ def inference(request: InferenceRequest):
             ),
             min_area_pixels=request.min_area_pixels,
             iou_threshold=request.iou_threshold,
+            valid_mask=valid_mask,
         )
 
         output_directory = (

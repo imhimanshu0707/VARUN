@@ -61,6 +61,7 @@ def run_inference(
     confidence_threshold: float = 0.5,
     min_area_pixels: int = 20,
     iou_threshold: float = 0.5,
+    valid_mask: Any = None,
 ) -> dict:
     """
     Run full-scene oil-spill segmentation.
@@ -79,7 +80,10 @@ def run_inference(
     # does not require bounding-box IoU suppression.
     _ = iou_threshold
 
-    prepared = preprocess_image(image)
+    prepared = preprocess_image(
+        image,
+        valid_mask=valid_mask,
+    )
 
     actual_height, actual_width = prepared.shape[-2:]
 
@@ -92,6 +96,26 @@ def run_inference(
             f"provided={image_width}x{image_height}, "
             f"actual={actual_width}x{actual_height}"
         )
+
+    if valid_mask is None:
+        output_valid_mask = np.ones(
+            (actual_height, actual_width),
+            dtype=bool,
+        )
+    else:
+        output_valid_mask = np.asarray(
+            valid_mask,
+            dtype=bool,
+        )
+
+        if output_valid_mask.shape != (
+            actual_height,
+            actual_width,
+        ):
+            raise ValueError(
+                "Validity mask dimensions do not match "
+                "the inference image"
+            )
 
     tiles = create_tiles(
         image_width=image_width,
@@ -133,6 +157,10 @@ def run_inference(
         image_width=image_width,
     )
 
+    probability_map[
+        ~output_valid_mask
+    ] = 0.0
+
     raw_mask = (
     probability_map >= confidence_threshold
     ).astype(np.uint8)
@@ -141,7 +169,12 @@ def run_inference(
     mask=raw_mask,
     min_area_pixels=min_area_pixels,
     connectivity=8,
-)
+    )
+
+    mask[
+          ~output_valid_mask
+    ] = 0
+
 
     # Bounding boxes are retained only for old backend/debug clients.
     # Final geographic output will be generated from the full mask.

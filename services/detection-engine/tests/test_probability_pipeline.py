@@ -56,3 +56,57 @@ def test_pipeline_returns_full_scene_probability_map(
     assert result["total_pixel_count"] == 360
     assert result["oil_coverage_percent"] == 100.0
     assert len(result["detections"]) == 1
+
+def test_pipeline_zeros_probability_on_invalid_pixels(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        pipeline_module,
+        "UNetPredictor",
+        FakePredictor,
+    )
+
+    image = np.stack(
+        [
+            np.arange(360, dtype=np.float32).reshape(18, 20),
+            np.arange(360, 720, dtype=np.float32).reshape(18, 20),
+        ]
+    )
+
+    valid_mask = np.ones((18, 20), dtype=bool)
+    valid_mask[:, :3] = False
+    valid_mask[9, 10] = False
+
+    result = pipeline_module.run_inference(
+        image=image,
+        image_width=20,
+        image_height=18,
+        model_path="unused-by-fake-model.pth",
+        tile_size=16,
+        overlap=4,
+        confidence_threshold=0.5,
+        min_area_pixels=2,
+        valid_mask=valid_mask,
+    )
+
+    assert np.all(
+        result["probability_map"][~valid_mask] == 0.0
+    )
+    assert np.all(
+        result["probability_map"][valid_mask] == 1.0
+    )
+
+    assert np.all(
+        result["mask"][~valid_mask] == 0
+    )
+    assert np.all(
+        result["mask"][valid_mask] == 1
+    )
+
+    expected_valid_pixels = (18 * 17)-1
+
+    assert (
+        result["oil_pixel_count"]
+        == expected_valid_pixels
+    )
+    assert result["total_pixel_count"] == 18 * 20
