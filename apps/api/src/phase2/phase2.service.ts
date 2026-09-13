@@ -19,8 +19,15 @@ interface Phase2Job {
   runId: string;
   caseId: string;
   phase1RunId: string;
+  sceneId: string;
+  observationTimeUtc: string;
+  spillGeometry: Record<string, unknown>;
   correlationId: string;
   mode: Phase2Mode;
+}
+
+interface Phase1GeometryRow {
+  spillGeometry: Record<string, unknown> | null;
 }
 
 interface Phase2EngineResponse {
@@ -192,8 +199,54 @@ export class Phase2Service {
       });
     }
 
+    const geometryRows =
+      await this.prisma.$queryRaw<
+        Phase1GeometryRow[]
+      >(
+        Prisma.sql`
+          SELECT
+            ST_AsGeoJSON(
+              ST_UnaryUnion(
+                ST_Collect(geometry)
+              )
+            )::json AS "spillGeometry"
+          FROM detection_regions
+          WHERE analysis_run_id =
+            ${input.phase1RunId}::uuid
+        `,
+      );
+
+    const spillGeometry =
+      geometryRows[0]?.spillGeometry;
+
+    if (!spillGeometry) {
+      throw new BadRequestException({
+        error: {
+          code: 'PHASE1_GEOMETRY_MISSING',
+          message:
+            'Phase-1 result does not contain a spill geometry.',
+          retryable: false,
+        },
+      });
+    }
+
+    if (!phase1.sceneId) {
+      throw new BadRequestException({
+        error: {
+          code: 'PHASE1_SCENE_MISSING',
+          message:
+            'Phase-1 run does not contain a scene ID.',
+          retryable: false,
+        },
+      });
+    }
+
     const snapshot = {
       phase1RunId: input.phase1RunId,
+      sceneId: phase1.sceneId,
+      observationTimeUtc:
+        phase1Result.observationTimeUtc.toISOString(),
+      spillGeometry,
       mode: input.mode,
       contractVersion:
         'phase1-to-phase2-v1',
@@ -302,6 +355,10 @@ export class Phase2Service {
           caseId: input.caseId,
           phase1RunId:
             input.phase1RunId,
+          sceneId: phase1.sceneId,
+          observationTimeUtc:
+            phase1Result.observationTimeUtc.toISOString(),
+          spillGeometry,
           correlationId,
           mode: input.mode,
         },
@@ -392,6 +449,11 @@ export class Phase2Service {
                 job.runId,
               phase1_handoff_ref:
                 job.phase1RunId,
+              scene_id: job.sceneId,
+              observation_time_utc:
+                job.observationTimeUtc,
+              spill_geometry:
+                job.spillGeometry,
               mode: job.mode,
             }),
           },

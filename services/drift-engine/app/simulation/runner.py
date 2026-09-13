@@ -3,6 +3,7 @@
 
 import csv
 import json
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -56,6 +57,7 @@ class Phase2CompleteRunner:
         observation_time: datetime,
         spill_polygon_geojson: dict,
         forcing_config: ForcingConfig,
+        run_id: Optional[str] = None,
         particle_count: int = 1500,
         release_ages_hours: Optional[list[int]] = None,
         forecast_hours: float = 12.0,
@@ -66,7 +68,16 @@ class Phase2CompleteRunner:
         Returns:
             Dictionary with execution summary and artifact paths
         """
-        self.run_id = generate_run_id()
+        if run_id is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}",
+            run_id,
+        ):
+            raise ValueError(
+                "run_id must contain only letters, numbers, "
+                "hyphens, or underscores"
+            )
+
+        self.run_id = run_id or generate_run_id()
         self.run_dir = ensure_output_dir(self.settings.output_dir, self.run_id)
 
         logger.info(f"\n{'='*70}")

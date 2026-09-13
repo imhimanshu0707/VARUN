@@ -2,15 +2,16 @@
 
 import hashlib
 import json
-import math
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from app.forcing.models import ForcingConfig
+from app.simulation.runner import Phase2CompleteRunner
 
 app = FastAPI(
     title="VARUN Phase 2 Drift",
@@ -26,6 +27,9 @@ class DriftRequest(BaseModel):
     case_id: str
     phase2_run_id: str
     phase1_handoff_ref: str
+    scene_id: str
+    observation_time_utc: datetime
+    spill_geometry: dict
     mode: Literal["HINDCAST_AND_FORECAST", "HINDCAST", "FORECAST"] = (
         "HINDCAST_AND_FORECAST"
     )
@@ -66,12 +70,112 @@ class DriftResponse(BaseModel):
 
 
 CONTRACT_VERSION = "phase2-to-phase3-v1"
-ENGINE_VERSION = "VARUN-PHASE2-DRIFT-V1"
+ENGINE_VERSION = "VARUN-PHASE2-DRIFT-V2"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def get_forcing_config() -> ForcingConfig:
+    combined_value = os.getenv(
+        "PHASE2_COMBINED_FORCING_FILE"
+    )
+    current_value = os.getenv(
+        "PHASE2_CURRENT_FORCING_FILE"
+    )
+    wind_value = os.getenv(
+        "PHASE2_WIND_FORCING_FILE"
+    )
+
+    if combined_value:
+        if current_value or wind_value:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Configure either combined forcing or "
+                    "separate current/wind forcing files"
+                ),
+            )
+
+        combined_path = Path(
+            combined_value
+        ).expanduser().resolve()
+
+        if not combined_path.is_file():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Configured combined forcing file "
+                    "does not exist"
+                ),
+            )
+
+        return ForcingConfig(
+            combined_file=combined_path
+        )
+
+    if current_value and wind_value:
+        current_path = Path(
+            current_value
+        ).expanduser().resolve()
+        wind_path = Path(
+            wind_value
+        ).expanduser().resolve()
+
+        if (
+            not current_path.is_file()
+            or not wind_path.is_file()
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Configured current or wind forcing "
+                    "file does not exist"
+                ),
+            )
+
+        return ForcingConfig(
+            current_file=current_path,
+            wind_file=wind_path,
+        )
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Phase 2 forcing is not configured. Set "
+            "PHASE2_COMBINED_FORCING_FILE or both "
+            "PHASE2_CURRENT_FORCING_FILE and "
+            "PHASE2_WIND_FORCING_FILE"
+        ),
+    )
+
+def get_particle_count() -> int:
+    raw_value = os.getenv(
+        "PHASE2_PARTICLE_COUNT",
+        "1500",
+    )
+
+    try:
+        particle_count = int(raw_value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "PHASE2_PARTICLE_COUNT must be an integer"
+            ),
+        ) from exc
+
+    if not 1 <= particle_count <= 10_000:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "PHASE2_PARTICLE_COUNT must be "
+                "between 1 and 10000"
+            ),
+        )
+
+    return particle_count
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -80,20 +184,6 @@ def utc_now() -> datetime:
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-
-def deterministic_offset(seed: int) -> tuple[float, float]:
-    """
-    Deterministic pseudo-drift used ONLY when a real OpenDrift execution
-    environment is not available.
-
-    It must never be represented as measured/scientific truth.
-    """
-    angle = seed * 1.61803398875
-
-    lat_offset = math.sin(angle) * 0.015
-    lon_offset = math.cos(angle) * 0.020
-
-    return lat_offset, lon_offset
 
 
 def sha256_json(value: object) -> str:
@@ -105,49 +195,65 @@ def sha256_json(value: object) -> str:
 
     return hashlib.sha256(payload).hexdigest()
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
 
-def make_points(
-    *,
-    seed: int,
-    start_lat: float,
-    start_lon: float,
-    start_time: datetime,
-    count: int,
-    hours_step: int,
-    direction: float,
-) -> list[Point]:
+    with path.open("rb") as file:
+        for chunk in iter(
+            lambda: file.read(1024 * 1024),
+            b"",
+        ):
+            digest.update(chunk)
 
-    lat_shift, lon_shift = deterministic_offset(seed)
+    return digest.hexdigest()
 
-    points: list[Point] = []
 
-    for i in range(count):
-        t = start_time + timedelta(hours=i * hours_step)
+def artifact_media_type(path: Path) -> str:
+    media_types = {
+        ".json": "application/json",
+        ".geojson": "application/geo+json",
+        ".csv": "text/csv",
+        ".nc": "application/x-netcdf",
+        ".png": "image/png",
+        ".mp4": "video/mp4",
+    }
 
-        progress = i / max(count - 1, 1)
+    return media_types.get(
+        path.suffix.lower(),
+        "application/octet-stream",
+    )
 
-        latitude = (
-            start_lat
-            + lat_shift * progress
-            + math.sin((seed + i) * 0.7) * 0.002
+
+def collect_artifacts(
+    output_dir: Path,
+) -> list[dict]:
+    artifacts = []
+
+    for path in sorted(output_dir.rglob("*")):
+        if not path.is_file():
+            continue
+
+        relative_name = path.relative_to(
+            output_dir
+        ).as_posix()
+
+        logical_name = relative_name.replace(
+            "/",
+            "__",
         )
 
-        longitude = (
-            start_lon
-            + lon_shift * progress
-            + direction * progress * 0.01
-            + math.cos((seed + i) * 0.5) * 0.002
+        artifacts.append(
+            {
+                "logicalName": logical_name,
+                "relativePath": relative_name,
+                "uri": str(path.resolve()),
+                "mediaType": artifact_media_type(path),
+                "checksumSha256": sha256_file(path),
+                "sizeBytes": path.stat().st_size,
+            }
         )
 
-        points.append(
-            Point(
-                latitude=round(latitude, 6),
-                longitude=round(longitude, 6),
-                timestamp_utc=iso(t),
-            )
-        )
-
-    return points
+    return artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -173,273 +279,193 @@ def version():
     }
 
 
-@app.post("/internal/v1/drift-runs", response_model=DriftResponse)
+@app.post(
+    "/internal/v1/drift-runs",
+    response_model=DriftResponse,
+)
 def run(request: DriftRequest) -> DriftResponse:
-
-    if not request.case_id:
+    if request.mode != "HINDCAST_AND_FORECAST":
         raise HTTPException(
-            status_code=400,
-            detail="case_id is required",
+            status_code=422,
+            detail=(
+                "The real Phase 2 pipeline currently requires "
+                "HINDCAST_AND_FORECAST mode"
+            ),
         )
 
-    if not request.phase2_run_id:
-        raise HTTPException(
-            status_code=400,
-            detail="phase2_run_id is required",
-        )
-
-    if not request.phase1_handoff_ref:
-        raise HTTPException(
-            status_code=400,
-            detail="phase1_handoff_ref is required",
-        )
-
+    forcing_config = get_forcing_config()
     started = utc_now()
-
-    # -----------------------------------------------------------------------
-    # Phase-1 handoff validation
-    #
-    # The NestJS service already validates that the referenced Phase-1 run
-    # exists and is completed. The engine therefore treats the reference as
-    # the immutable input identity.
-    # -----------------------------------------------------------------------
 
     handoff_digest = sha256_json(
         {
             "case_id": request.case_id,
-            "phase1_handoff_ref": request.phase1_handoff_ref,
+            "scene_id": request.scene_id,
+            "observation_time_utc": iso(
+                request.observation_time_utc
+            ),
+            "spill_geometry": request.spill_geometry,
+            "phase1_handoff_ref":
+                request.phase1_handoff_ref,
         }
     )
 
-    # -----------------------------------------------------------------------
-    # Forcing contract
-    # -----------------------------------------------------------------------
+    runner = Phase2CompleteRunner()
 
-    forcing = {
-        "source": "PHASE1_HANDOFF",
-        "forcingStatus": "VALIDATED",
-        "wind": {
-            "source": "HANDOFF_REQUIRED",
-            "available": False,
-        },
-        "oceanCurrent": {
-            "source": "HANDOFF_REQUIRED",
-            "available": False,
-        },
-        "seaSurfaceTemperature": {
-            "source": "HANDOFF_REQUIRED",
-            "available": False,
-        },
-    }
+    result = runner.run(
+        case_id=request.case_id,
+        scene_id=request.scene_id,
+        observation_time=request.observation_time_utc,
+        spill_polygon_geojson=request.spill_geometry,
+        forcing_config=forcing_config,
+        run_id=request.phase2_run_id,
+        particle_count=get_particle_count(),
+    )
+
+    if result.get("status") != "SUCCESS":
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "PHASE2_SIMULATION_FAILED",
+                "message": result.get(
+                    "error",
+                    "Real Phase 2 simulation failed",
+                ),
+            },
+        )
+
+    output_dir_value = result.get("output_dir")
+
+    if not output_dir_value:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "PHASE2_OUTPUT_MISSING",
+                "message": (
+                    "Phase 2 completed without an output directory"
+                ),
+            },
+        )
+
+    output_dir = Path(output_dir_value).resolve()
+    artifacts = collect_artifacts(output_dir)
+
+    summary = result.get("summary", {})
+    validation = result.get("validation", {})
+
+    metrics_path = (
+        output_dir / "reconstruction_metrics.json"
+    )
+    reconstruction_metrics = (
+        json.loads(metrics_path.read_text(encoding="utf-8"))
+        if metrics_path.is_file()
+        else {}
+    )
+
+    search_window_path = (
+        output_dir / "search_window.json"
+    )
+    search_window = (
+        json.loads(
+            search_window_path.read_text(
+                encoding="utf-8"
+            )
+        )
+        if search_window_path.is_file()
+        else {}
+    )
+
+    successful_release_ages = summary.get(
+        "successful_release_ages",
+        [],
+    )
+
+    forcing_files = [
+        str(path.resolve())
+        for path in forcing_config.get_files()
+    ]
 
     warnings: list[str] = []
 
-    # -----------------------------------------------------------------------
-    # Seeding
-    #
-    # Phase-1 output may provide geometry, but the current backend contract
-    # only gives us the run reference. Keep deterministic seed metadata
-    # without inventing geographic coordinates.
-    # -----------------------------------------------------------------------
+    if validation.get("status") != "PASS":
+        warnings.append(
+            "Phase 2 completed, but one or more "
+            "validation checks did not pass."
+        )
 
-    seed_count = 5
-
-    seeding = {
-        "strategy": "PHASE1_RESULT_REFERENCE",
-        "seedCount": seed_count,
-        "seedSource": request.phase1_handoff_ref,
-        "seedDigest": handoff_digest,
-    }
-
-    # -----------------------------------------------------------------------
-    # Deterministic integration fixture
-    #
-    # This produces a structurally valid handoff while explicitly marking
-    # that live environmental forcing was unavailable.
-    # -----------------------------------------------------------------------
-
-    base_lat = 20.0
-    base_lon = 68.0
-
-    if request.mode in ("HINDCAST_AND_FORECAST", "HINDCAST"):
-
-        hindcast_start = started - timedelta(hours=24)
-
-        hindcast_trajectories = []
-
-        for seed in range(seed_count):
-            points = make_points(
-                seed=seed,
-                start_lat=base_lat,
-                start_lon=base_lon,
-                start_time=hindcast_start,
-                count=7,
-                hours_step=4,
-                direction=-1.0,
-            )
-
-            hindcast_trajectories.append(
-                DriftTrajectory(
-                    trajectory_id=f"hindcast-{seed + 1}",
-                    kind="HINDCAST",
-                    seed_index=seed,
-                    points=points,
-                )
-            )
-
-    else:
-        hindcast_trajectories = []
-
-    if request.mode in ("HINDCAST_AND_FORECAST", "FORECAST"):
-
-        reconstruction_start = started - timedelta(hours=12)
-
-        reconstruction_trajectories = []
-
-        for seed in range(seed_count):
-            points = make_points(
-                seed=seed + 100,
-                start_lat=base_lat,
-                start_lon=base_lon,
-                start_time=reconstruction_start,
-                count=7,
-                hours_step=2,
-                direction=0.5,
-            )
-
-            reconstruction_trajectories.append(
-                DriftTrajectory(
-                    trajectory_id=f"reconstruction-{seed + 1}",
-                    kind="RECONSTRUCTION",
-                    seed_index=seed,
-                    points=points,
-                )
-            )
-
-    else:
-        reconstruction_trajectories = []
-
-    if request.mode in ("HINDCAST_AND_FORECAST", "FORECAST"):
-
-        forecast_start = started
-
-        forecast_trajectories = []
-
-        for seed in range(seed_count):
-            points = make_points(
-                seed=seed + 200,
-                start_lat=base_lat,
-                start_lon=base_lon,
-                start_time=forecast_start,
-                count=13,
-                hours_step=2,
-                direction=1.0,
-            )
-
-            forecast_trajectories.append(
-                DriftTrajectory(
-                    trajectory_id=f"forecast-{seed + 1}",
-                    kind="FORECAST",
-                    seed_index=seed,
-                    points=points,
-                )
-            )
-
-    else:
-        forecast_trajectories = []
-
-    trajectories = (
-        hindcast_trajectories
-        + reconstruction_trajectories
-        + forecast_trajectories
+    response_status = (
+        "COMPLETED"
+        if not warnings
+        else "COMPLETED_WITH_WARNINGS"
     )
 
-    # -----------------------------------------------------------------------
-    # Validation
-    # -----------------------------------------------------------------------
-
-    validation = {
-        "status": "COMPLETED_WITH_WARNINGS",
-        "trajectoryCount": len(trajectories),
-        "seedCount": seed_count,
-        "geometryValid": True,
-        "timestampsMonotonic": True,
-        "forcingValidated": False,
-    }
-
-    warnings.append(
-        "Live environmental forcing was not available; "
-        "trajectory coordinates are deterministic integration fixtures "
-        "and must not be interpreted as scientific forecast truth."
-    )
-
-    # -----------------------------------------------------------------------
-    # Artifacts metadata
-    # -----------------------------------------------------------------------
-
-    trajectory_payload = [
-        trajectory.model_dump()
-        for trajectory in trajectories
-    ]
-
-    artifact_digest = sha256_json(trajectory_payload)
-
-    artifacts = [
-        {
-            "logicalName": "phase2-trajectories.json",
-            "mediaType": "application/json",
-            "checksumSha256": artifact_digest,
-        },
-        {
-            "logicalName": "phase2-provenance.json",
-            "mediaType": "application/json",
-            "checksumSha256": sha256_json(
-                {
-                    "engineVersion": ENGINE_VERSION,
-                    "contractVersion": CONTRACT_VERSION,
-                    "handoffDigest": handoff_digest,
-                }
-            ),
-        },
-    ]
-
-    provenance = {
-        "engineVersion": ENGINE_VERSION,
-        "contractVersion": CONTRACT_VERSION,
-        "phase1HandoffRef": request.phase1_handoff_ref,
-        "phase1HandoffDigest": handoff_digest,
-        "executionStartedAt": iso(started),
-        "executionFinishedAt": iso(utc_now()),
-        "scientificBackend": "OpenDrift/OpenOil",
-        "executionMode": request.mode,
-        "dataOrigin": "DETERMINISTIC_INTEGRATION_FIXTURE",
-        "artifactSha256": artifact_digest,
-        "validation": validation,
-    }
+    finished = utc_now()
 
     return DriftResponse(
-        status="COMPLETED_WITH_WARNINGS",
+        status=response_status,
         contract_version=CONTRACT_VERSION,
         phase2_run_id=request.phase2_run_id,
         case_id=request.case_id,
-        data_origin="DETERMINISTIC_INTEGRATION_FIXTURE",
-        forcing=forcing,
-        seeding=seeding,
+        data_origin="PHASE1_HANDOFF_OPENOIL",
+        forcing={
+            "source": "CONFIGURED_NETCDF",
+            "files": forcing_files,
+            "validated": True,
+        },
+        seeding={
+            "strategy": "PHASE1_SPILL_GEOMETRY",
+            "particleCount": summary.get(
+                "particle_count"
+            ),
+            "sourceRunId":
+                request.phase1_handoff_ref,
+        },
         hindcast={
-            "enabled": request.mode in ("HINDCAST_AND_FORECAST", "HINDCAST"),
-            "trajectoryCount": len(hindcast_trajectories),
+            "enabled": True,
+            "releaseAgesHours": summary.get(
+                "release_ages",
+                [],
+            ),
+            "successfulReleaseAgesHours":
+                successful_release_ages,
+            "bestReleaseAgeHours": summary.get(
+                "best_release_age_hours"
+            ),
         },
         reconstruction={
-            "enabled": request.mode in ("HINDCAST_AND_FORECAST", "FORECAST"),
-            "trajectoryCount": len(reconstruction_trajectories),
+            "enabled": True,
+            "metrics": reconstruction_metrics,
         },
         forecast={
-            "enabled": request.mode in ("HINDCAST_AND_FORECAST", "FORECAST"),
-            "trajectoryCount": len(forecast_trajectories),
-            "horizonHours": 24,
+            "enabled": True,
+            "horizonHours": summary.get(
+                "forecast_hours"
+            ),
         },
-        trajectories=trajectories,
+        trajectories=[],
         artifacts=artifacts,
-        provenance=provenance,
+        provenance={
+            "engineVersion": ENGINE_VERSION,
+            "contractVersion": CONTRACT_VERSION,
+            "phase1HandoffRef":
+                request.phase1_handoff_ref,
+            "phase1HandoffDigest":
+                handoff_digest,
+            "sceneId": request.scene_id,
+            "observationTimeUtc": iso(
+                request.observation_time_utc
+            ),
+            "executionStartedAt": iso(started),
+            "executionFinishedAt": iso(finished),
+            "scientificBackend":
+                "OpenDrift/OpenOil",
+            "executionMode": request.mode,
+            "dataOrigin":
+                "PHASE1_HANDOFF_OPENOIL",
+            "outputDirectory": str(output_dir),
+            "searchWindow": search_window,
+            "validation": validation,
+            "trajectoryDelivery":
+                "NETCDF_AND_GEOJSON_ARTIFACTS",
+        },
         warnings=warnings,
     )
