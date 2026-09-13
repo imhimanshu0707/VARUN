@@ -88,3 +88,5 @@ artifacts/reproducibility/
 services/drift-engine/outputs/
 # Phase-1 runtime inference artifacts
 /outputs/
+# API runtime-persisted artifacts
+/apps/api/artifacts/

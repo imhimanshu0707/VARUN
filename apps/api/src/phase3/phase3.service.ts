@@ -746,6 +746,21 @@ export class Phase3Service {
       orderBy: { createdAt: 'asc' },
     });
 
+        // Engine-backed runs store projected candidates in run provenance.
+    // Normalized legacy runs continue using the candidate tables above.
+    if (candidates.length === 0) {
+      const attribution = await this.getAttribution(runId);
+
+      return {
+        runId,
+        phase: 'PHASE3',
+        status: run.status,
+        dataOrigin: run.dataOrigin,
+        candidates: attribution.candidates,
+        disclaimer: LEGAL_DISCLAIMER,
+      };
+    }
+
     return {
       runId,
       phase: 'PHASE3',
