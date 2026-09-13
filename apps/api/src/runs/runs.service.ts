@@ -10,11 +10,7 @@ import { PrismaService } from '../database/prisma.service';
 import { Phase1EngineClient } from './phase1-engine.client';
 import { Phase1ResultPersistence } from './phase1-result.persistence';
 
-export type TestRunStatus =
-  | 'QUEUED'
-  | 'RUNNING'
-  | 'COMPLETED'
-  | 'FAILED';
+export type TestRunStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
 
 export interface TestRun {
   runId: string;
@@ -52,10 +48,8 @@ export class RunsService implements OnModuleInit, OnModuleDestroy {
 
   private sanitizeAttributionMetadata(metadata: unknown) {
     const source =
-      metadata &&
-      typeof metadata === 'object' &&
-      !Array.isArray(metadata)
-        ? metadata as Record<string, unknown>
+      metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+        ? (metadata as Record<string, unknown>)
         : {};
 
     return {
@@ -64,26 +58,18 @@ export class RunsService implements OnModuleInit, OnModuleDestroy {
           ? source.candidateLabel
           : 'Candidate',
 
-      source:
-        typeof source.source === 'string'
-          ? source.source
-          : 'AIS_FILTER',
+      source: typeof source.source === 'string' ? source.source : 'AIS_FILTER',
 
       dataOrigin:
-        typeof source.dataOrigin === 'string'
-          ? source.dataOrigin
-          : 'UNKNOWN',
+        typeof source.dataOrigin === 'string' ? source.dataOrigin : 'UNKNOWN',
     };
   }
-
 
   async onModuleInit(): Promise<void> {
     const connectionString = process.env.DATABASE_URL;
 
     if (!connectionString) {
-      this.logger.warn(
-        'DATABASE_URL is not configured. Queue is disabled.',
-      );
+      this.logger.warn('DATABASE_URL is not configured. Queue is disabled.');
       return;
     }
 
@@ -94,327 +80,279 @@ export class RunsService implements OnModuleInit, OnModuleDestroy {
 
       await this.boss.createQueue('test-run');
 
-      await this.boss.work<TestJobData>(
-        'test-run',
-        async (jobs) => {
-          const job = jobs[0];
+      await this.boss.work<TestJobData>('test-run', async (jobs) => {
+        const job = jobs[0];
 
-          if (!job) {
+        if (!job) {
+          return;
+        }
+
+        const { runId, jobExecutionId, correlationId } = job.data;
+
+        const run = this.runs.get(runId);
+
+        /*
+         * A process restart can clear the in-memory map.
+         * In that case the database remains the source of truth.
+         */
+        if (!run) {
+          const dbRun = await this.prisma.analysisRun.findUnique({
+            where: {
+              id: runId,
+            },
+          });
+
+          if (!dbRun) {
+            this.logger.warn(`Run ${runId} not found`);
             return;
           }
 
-          const {
-            runId,
-            jobExecutionId,
+          this.runs.set(runId, {
+            runId: dbRun.id,
+            status: dbRun.status as TestRunStatus,
+            progress:
+              dbRun.status === 'COMPLETED'
+                ? 100
+                : dbRun.status === 'PROCESSING'
+                  ? 50
+                  : 0,
+            createdAt: dbRun.createdAt.toISOString(),
+            startedAt: dbRun.startedAt?.toISOString(),
+            completedAt: dbRun.finishedAt?.toISOString(),
+          });
+        }
+
+        const currentRun = this.runs.get(runId);
+
+        if (!currentRun) {
+          return;
+        }
+
+        // ---------------------------------
+        // RUNNING
+        // ---------------------------------
+
+        const startedAt = new Date();
+
+        currentRun.status = 'RUNNING';
+        currentRun.progress = 50;
+        currentRun.startedAt = startedAt.toISOString();
+
+        await this.prisma.jobExecution.update({
+          where: {
+            id: jobExecutionId,
+          },
+          data: {
+            status: 'RUNNING',
+            startedAt,
             correlationId,
-          } = job.data;
+          },
+        });
 
-          const run = this.runs.get(runId);
+        await this.prisma.analysisRun.update({
+          where: {
+            id: runId,
+          },
+          data: {
+            status: 'PROCESSING',
+            startedAt,
+          },
+        });
 
-          /*
-           * A process restart can clear the in-memory map.
-           * In that case the database remains the source of truth.
-           */
-          if (!run) {
-            const dbRun =
-              await this.prisma.analysisRun.findUnique({
-                where: {
-                  id: runId,
-                },
-              });
+        await this.prisma.runEvent.create({
+          data: {
+            analysisRunId: runId,
+            status: 'PROCESSING',
+            stage: 'TEST_PROCESSING',
+            progressPercent: 50,
+            safeMessage: 'Test run processing started.',
+            correlationId,
+            details: {},
+          },
+        });
 
-            if (!dbRun) {
-              this.logger.warn(
-                `Run ${runId} not found`,
-              );
-              return;
-            }
+        // ---------------------------------
+        // SIMULATE PROCESSING
+        // ---------------------------------
 
-            this.runs.set(runId, {
-              runId: dbRun.id,
-              status: dbRun.status as TestRunStatus,
-              progress:
-                dbRun.status === 'COMPLETED'
-                  ? 100
-                  : dbRun.status === 'PROCESSING'
-                    ? 50
-                    : 0,
-              createdAt:
-                dbRun.createdAt.toISOString(),
-              startedAt:
-                dbRun.startedAt?.toISOString(),
-              completedAt:
-                dbRun.finishedAt?.toISOString(),
-            });
-          }
+        // ---------------------------------
+        // LOAD RUN INPUT
+        // ---------------------------------
 
-          const currentRun = this.runs.get(runId);
+        const dbRun = await this.prisma.analysisRun.findUnique({
+          where: {
+            id: runId,
+          },
+        });
 
-          if (!currentRun) {
-            return;
-          }
+        if (!dbRun) {
+          throw new Error(`Run ${runId} not found`);
+        }
 
-          // ---------------------------------
-          // RUNNING
-          // ---------------------------------
+        const snapshot =
+          dbRun.inputSnapshot &&
+          typeof dbRun.inputSnapshot === 'object' &&
+          !Array.isArray(dbRun.inputSnapshot)
+            ? (dbRun.inputSnapshot as Record<string, unknown>)
+            : {};
 
-          const startedAt = new Date();
+        const input = {
+          imagePath:
+            typeof snapshot.imagePath === 'string'
+              ? snapshot.imagePath
+              : undefined,
 
-          currentRun.status = 'RUNNING';
-          currentRun.progress = 50;
-          currentRun.startedAt =
-            startedAt.toISOString();
+          imageWidth:
+            typeof snapshot.imageWidth === 'number'
+              ? snapshot.imageWidth
+              : undefined,
 
-          await this.prisma.jobExecution.update({
-            where: {
-              id: jobExecutionId,
-            },
-            data: {
-              status: 'RUNNING',
-              startedAt,
-              correlationId,
-            },
-          });
+          imageHeight:
+            typeof snapshot.imageHeight === 'number'
+              ? snapshot.imageHeight
+              : undefined,
 
-          await this.prisma.analysisRun.update({
-            where: {
-              id: runId,
-            },
-            data: {
-              status: 'PROCESSING',
-              startedAt,
-            },
-          });
+          caseId:
+            typeof snapshot.caseId === 'string'
+              ? snapshot.caseId
+              : dbRun.caseId,
 
-          await this.prisma.runEvent.create({
-            data: {
-              analysisRunId: runId,
-              status: 'PROCESSING',
-              stage: 'TEST_PROCESSING',
-              progressPercent: 50,
-              safeMessage:
-                'Test run processing started.',
-              correlationId,
-              details: {},
-            },
-          });
+          sceneId:
+            typeof snapshot.sceneId === 'string'
+              ? snapshot.sceneId
+              : (dbRun.sceneId ?? undefined),
 
-          // ---------------------------------
-          // SIMULATE PROCESSING
-          // ---------------------------------
+          acquisitionTimeUtc:
+            typeof snapshot.acquisitionTimeUtc === 'string'
+              ? snapshot.acquisitionTimeUtc
+              : undefined,
 
-         // ---------------------------------
-// LOAD RUN INPUT
-// ---------------------------------
+          tileSize:
+            typeof snapshot.tileSize === 'number' ? snapshot.tileSize : 512,
 
-const dbRun =
-  await this.prisma.analysisRun.findUnique({
-    where: {
-      id: runId,
-    },
-  });
+          overlap: typeof snapshot.overlap === 'number' ? snapshot.overlap : 64,
 
-if (!dbRun) {
-  throw new Error(`Run ${runId} not found`);
-}
+          confidenceThreshold:
+            typeof snapshot.confidenceThreshold === 'number'
+              ? snapshot.confidenceThreshold
+              : 0.5,
 
-const snapshot =
-  dbRun.inputSnapshot &&
-  typeof dbRun.inputSnapshot === 'object' &&
-  !Array.isArray(dbRun.inputSnapshot)
-    ? dbRun.inputSnapshot as Record<string, unknown>
-    : {};
+          iouThreshold:
+            typeof snapshot.iouThreshold === 'number'
+              ? snapshot.iouThreshold
+              : 0.5,
 
-const input = {
-  imagePath:
-    typeof snapshot.imagePath === 'string'
-      ? snapshot.imagePath
-      : undefined,
+          minAreaPixels:
+            typeof snapshot.minAreaPixels === 'number'
+              ? snapshot.minAreaPixels
+              : 20,
+        };
 
-  imageWidth:
-    typeof snapshot.imageWidth === 'number'
-      ? snapshot.imageWidth
-      : undefined,
+        if (
+          !input.imagePath ||
+          !input.imageWidth ||
+          !input.imageHeight ||
+          !input.caseId ||
+          !input.sceneId ||
+          !input.acquisitionTimeUtc
+        ) {
+          throw new Error(
+            'Run inputSnapshot is missing Phase-1 image or handoff metadata',
+          );
+        }
 
-  imageHeight:
-    typeof snapshot.imageHeight === 'number'
-      ? snapshot.imageHeight
-      : undefined,
+        // ---------------------------------
+        // PHASE-1 DETECTION ENGINE
+        // ---------------------------------
 
-        caseId:
-    typeof snapshot.caseId === 'string'
-      ? snapshot.caseId
-      : dbRun.caseId,
+        const engineResult = await this.phase1Engine.infer({
+          imagePath: input.imagePath,
+          imageWidth: input.imageWidth,
+          imageHeight: input.imageHeight,
 
-  sceneId:
-    typeof snapshot.sceneId === 'string'
-      ? snapshot.sceneId
-      : dbRun.sceneId ?? undefined,
+          caseId: input.caseId,
+          sceneId: input.sceneId,
+          acquisitionTimeUtc: input.acquisitionTimeUtc,
 
-  acquisitionTimeUtc:
-    typeof snapshot.acquisitionTimeUtc === 'string'
-      ? snapshot.acquisitionTimeUtc
-      : undefined,
+          tileSize: input.tileSize,
+          overlap: input.overlap,
+          confidenceThreshold: input.confidenceThreshold,
+          minAreaPixels: input.minAreaPixels,
+          iouThreshold: input.iouThreshold,
+        });
+        const persistenceResult = await this.phase1ResultPersistence.persist(
+          runId,
+          engineResult,
+        );
+        // ---------------------------------
+        // COMPLETED
+        // ---------------------------------
 
-  tileSize:
-    typeof snapshot.tileSize === 'number'
-      ? snapshot.tileSize
-      : 512,
+        const completedAt = new Date();
 
-  overlap:
-    typeof snapshot.overlap === 'number'
-      ? snapshot.overlap
-      : 64,
+        currentRun.status = 'COMPLETED';
+        currentRun.progress = 100;
+        currentRun.completedAt = completedAt.toISOString();
 
-  confidenceThreshold:
-    typeof snapshot.confidenceThreshold === 'number'
-      ? snapshot.confidenceThreshold
-      : 0.5,
+        await this.prisma.jobExecution.update({
+          where: {
+            id: jobExecutionId,
+          },
+          data: {
+            status: 'COMPLETED',
+            completedAt,
+          },
+        });
 
-  iouThreshold:
-    typeof snapshot.iouThreshold === 'number'
-      ? snapshot.iouThreshold
-      : 0.5,
+        await this.prisma.analysisRun.update({
+          where: {
+            id: runId,
+          },
+          data: {
+            status: 'COMPLETED',
+            finishedAt: completedAt,
+          },
+        });
 
-  minAreaPixels:
-    typeof snapshot.minAreaPixels === 'number'
-      ? snapshot.minAreaPixels
-      : 20,
-};
+        await this.prisma.runEvent.create({
+          data: {
+            analysisRunId: runId,
+            status: 'COMPLETED',
+            stage: 'TEST_COMPLETED',
+            progressPercent: 100,
+            safeMessage: 'Test run completed successfully.',
+            correlationId,
+            details: {
+              contractVersion: engineResult.contract_version,
+              phase1EngineRunId: engineResult.run_id,
+              oilDetected: engineResult.oil_detected,
+              confidence: engineResult.confidence,
+              artifacts: {
+                spillDetectionGeojson:
+                  engineResult.artifacts.spill_detection_geojson,
 
-if (
-  !input.imagePath ||
-  !input.imageWidth ||
-  !input.imageHeight ||
-  !input.caseId ||
-  !input.sceneId ||
-  !input.acquisitionTimeUtc
-) {
-  throw new Error(
-    'Run inputSnapshot is missing Phase-1 image or handoff metadata',
-  );
-}
+                detectionSummaryJson:
+                  engineResult.artifacts.detection_summary_json,
 
-// ---------------------------------
-// PHASE-1 DETECTION ENGINE
-// ---------------------------------
+                oilProbabilityTif: engineResult.artifacts.oil_probability_tif,
 
-const engineResult =
-  await this.phase1Engine.infer({
-    imagePath: input.imagePath,
-    imageWidth: input.imageWidth,
-    imageHeight: input.imageHeight,
+                oilMaskTif: engineResult.artifacts.oil_mask_tif,
 
-    caseId: input.caseId,
-    sceneId: input.sceneId,
-    acquisitionTimeUtc:
-      input.acquisitionTimeUtc,
-
-    tileSize: input.tileSize,
-    overlap: input.overlap,
-    confidenceThreshold:
-      input.confidenceThreshold,
-    minAreaPixels:
-      input.minAreaPixels,
-    iouThreshold:
-      input.iouThreshold,
-  });
-const persistenceResult =
-     await this.phase1ResultPersistence.persist(
-    runId,
-    engineResult,
-  );
-          // ---------------------------------
-          // COMPLETED
-          // ---------------------------------
-
-          const completedAt = new Date();
-
-          currentRun.status = 'COMPLETED';
-          currentRun.progress = 100;
-          currentRun.completedAt =
-            completedAt.toISOString();
-
-          await this.prisma.jobExecution.update({
-            where: {
-              id: jobExecutionId,
-            },
-            data: {
-              status: 'COMPLETED',
-              completedAt,
-            },
-          });
-
-          await this.prisma.analysisRun.update({
-            where: {
-              id: runId,
-            },
-            data: {
-              status: 'COMPLETED',
-              finishedAt: completedAt,
-            },
-          });
-
-          await this.prisma.runEvent.create({
-            data: {
-              analysisRunId: runId,
-              status: 'COMPLETED',
-              stage: 'TEST_COMPLETED',
-              progressPercent: 100,
-              safeMessage:
-                'Test run completed successfully.',
-              correlationId,
-              details: {
-              contractVersion:
-                engineResult.contract_version,
-              phase1EngineRunId:
-                engineResult.run_id,
-              oilDetected:
-                engineResult.oil_detected,
-              confidence:
-                engineResult.confidence,
-             artifacts: {
-  spillDetectionGeojson:
-    engineResult.artifacts
-      .spill_detection_geojson,
-
-  detectionSummaryJson:
-    engineResult.artifacts
-      .detection_summary_json,
-
-  oilProbabilityTif:
-    engineResult.artifacts
-      .oil_probability_tif,
-
-  oilMaskTif:
-    engineResult.artifacts
-      .oil_mask_tif,
-
-  previewPng:
-    engineResult.artifacts
-      .preview_png,
-},
-  persistence: {
-      phase1ResultStored:
-    persistenceResult.phase1ResultStored,
-  detectionCount:
-    persistenceResult.detectionCount,
-  artifactCount:
-    persistenceResult.artifactCount,
-},
+                previewPng: engineResult.artifacts.preview_png,
+              },
+              persistence: {
+                phase1ResultStored: persistenceResult.phase1ResultStored,
+                detectionCount: persistenceResult.detectionCount,
+                artifactCount: persistenceResult.artifactCount,
               },
             },
-          });
+          },
+        });
 
-          this.logger.log(
-            `Test run ${runId} completed`,
-          );
-        },
-      );
+        this.logger.log(`Test run ${runId} completed`);
+      });
 
-      this.logger.log(
-        'pg-boss queue initialized successfully.',
-      );
+      this.logger.log('pg-boss queue initialized successfully.');
     } catch (_error) {
       this.logger.warn(
         'PostgreSQL/pg-boss is unavailable. Queue is disabled for this session.',
@@ -445,53 +383,77 @@ const persistenceResult =
     const runId = randomUUID();
 
     const caseId =
-      '00000000-0000-4000-8000-000000000001';
+      process.env.PHASE1_DEMO_CASE_ID ?? '00000000-0000-4000-8000-000000000001';
 
     const sceneId =
+      process.env.PHASE1_DEMO_SCENE_ID ??
       '00000000-0000-4000-8000-000000000002';
 
-      const demoThreshold = Number(
-  process.env.PHASE1_DEMO_THRESHOLD ?? '0.5',
-);
+    const dataOrigin = process.env.PHASE1_DEMO_DATA_ORIGIN ?? 'SYNTHETIC';
 
-if (
-  !Number.isFinite(demoThreshold) ||
-  demoThreshold <= 0 ||
-  demoThreshold >= 1
-) {
-  throw new Error(
-    'PHASE1_DEMO_THRESHOLD must be between 0 and 1',
-  );
-}
+    if (dataOrigin !== 'REAL' && dataOrigin !== 'SYNTHETIC') {
+      throw new Error('PHASE1_DEMO_DATA_ORIGIN must be REAL or SYNTHETIC');
+    }
+
+    const acquisitionTimeUtc =
+      process.env.PHASE1_DEMO_ACQUISITION_TIME_UTC ?? '2026-09-02T12:00:00Z';
+
+    const imagePath =
+      process.env.PHASE1_DEMO_IMAGE_PATH ??
+      'data/fixtures/images/synthetic_spill.tif';
+
+    const imageWidth = Number(process.env.PHASE1_DEMO_IMAGE_WIDTH ?? '512');
+
+    const imageHeight = Number(process.env.PHASE1_DEMO_IMAGE_HEIGHT ?? '512');
+
+    const demoThreshold = Number(process.env.PHASE1_DEMO_THRESHOLD ?? '0.5');
+
+    if (
+      !Number.isFinite(demoThreshold) ||
+      demoThreshold <= 0 ||
+      demoThreshold >= 1
+    ) {
+      throw new Error('PHASE1_DEMO_THRESHOLD must be between 0 and 1');
+    }
+
+    if (
+      !Number.isInteger(imageWidth) ||
+      !Number.isInteger(imageHeight) ||
+      imageWidth <= 0 ||
+      imageHeight <= 0
+    ) {
+      throw new Error(
+        'PHASE1 demo image width and height must be positive integers',
+      );
+    }
+
+    if (Number.isNaN(Date.parse(acquisitionTimeUtc))) {
+      throw new Error(
+        'PHASE1_DEMO_ACQUISITION_TIME_UTC must be a valid timestamp',
+      );
+    }
 
     const inputSnapshot = {
-  type: 'TEST_RUN',
-  caseId,
-  sceneId,
-  acquisitionTimeUtc:
-  '2026-09-02T12:00:00Z',
-
-  imagePath:
-  process.env.PHASE1_DEMO_IMAGE_PATH ??
-  'data/fixtures/images/synthetic_spill.tif',
-
-  imageWidth: 512,
-  imageHeight: 512,
-
-  tileSize: 512,
-  overlap: 64,
-
-  confidenceThreshold: demoThreshold,
-  iouThreshold: 0.5,
-  minAreaPixels: 20,
-};
+      type: 'TEST_RUN',
+      dataOrigin,
+      caseId,
+      sceneId,
+      acquisitionTimeUtc,
+      imagePath,
+      imageWidth,
+      imageHeight,
+      tileSize: 512,
+      overlap: 64,
+      confidenceThreshold: demoThreshold,
+      iouThreshold: 0.5,
+      minAreaPixels: 20,
+    };
 
     const configHash = createHash('sha256')
       .update(JSON.stringify(inputSnapshot))
       .digest('hex');
 
-    const idempotencyKey =
-      `test-run-${runId}`;
+    const idempotencyKey = `test-run-${runId}`;
 
     const correlationId = randomUUID();
 
@@ -507,14 +469,12 @@ if (
 
         phase: 'PHASE1',
         status: 'QUEUED',
-        dataOrigin: 'SYNTHETIC',
+        dataOrigin,
 
         idempotencyKey,
 
-        inputContractVersion:
-         'phase1-to-phase2-v1',
-        outputContractVersion:
-         'phase1-to-phase2-v1',
+        inputContractVersion: 'phase1-to-phase2-v1',
+        outputContractVersion: 'phase1-to-phase2-v1',
 
         configHash,
         codeVersion: 'dev',
@@ -564,8 +524,7 @@ if (
         id: jobExecutionId,
         analysisRunId: runId,
         queueName: 'test-run',
-        idempotencyKey:
-          `job-${runId}`,
+        idempotencyKey: `job-${runId}`,
         attemptNo: 1,
         status: 'QUEUED',
         correlationId,
@@ -576,12 +535,11 @@ if (
     // PG-BOSS JOB
     // ---------------------------------
 
-    const bossJobId =
-      await this.boss.send('test-run', {
-        runId,
-        jobExecutionId,
-        correlationId,
-      });
+    const bossJobId = await this.boss.send('test-run', {
+      runId,
+      jobExecutionId,
+      correlationId,
+    });
 
     if (bossJobId) {
       await this.prisma.jobExecution.update({
@@ -589,8 +547,7 @@ if (
           id: jobExecutionId,
         },
         data: {
-          bossJobId:
-            bossJobId as string,
+          bossJobId: bossJobId as string,
         },
       });
     }
@@ -602,45 +559,35 @@ if (
   // GET RUN
   // =========================================
 
-  async getRun(
-    runId: string,
-  ): Promise<TestRun> {
-    const memoryRun =
-      this.runs.get(runId);
+  async getRun(runId: string): Promise<TestRun> {
+    const memoryRun = this.runs.get(runId);
 
     if (memoryRun) {
       return memoryRun;
     }
 
-    const dbRun =
-      await this.prisma.analysisRun.findUnique({
-        where: {
-          id: runId,
-        },
-      });
+    const dbRun = await this.prisma.analysisRun.findUnique({
+      where: {
+        id: runId,
+      },
+    });
 
     if (!dbRun) {
-      throw new Error(
-        `Run ${runId} not found`,
-      );
+      throw new Error(`Run ${runId} not found`);
     }
 
     const run: TestRun = {
       runId: dbRun.id,
-      status:
-        dbRun.status as TestRunStatus,
+      status: dbRun.status as TestRunStatus,
       progress:
         dbRun.status === 'COMPLETED'
           ? 100
           : dbRun.status === 'PROCESSING'
             ? 50
             : 0,
-      createdAt:
-        dbRun.createdAt.toISOString(),
-      startedAt:
-        dbRun.startedAt?.toISOString(),
-      completedAt:
-        dbRun.finishedAt?.toISOString(),
+      createdAt: dbRun.createdAt.toISOString(),
+      startedAt: dbRun.startedAt?.toISOString(),
+      completedAt: dbRun.finishedAt?.toISOString(),
     };
 
     this.runs.set(runId, run);
@@ -653,28 +600,24 @@ if (
   // =========================================
 
   async getRunEvents(runId: string) {
-    const dbRun =
-      await this.prisma.analysisRun.findUnique({
-        where: {
-          id: runId,
-        },
-      });
+    const dbRun = await this.prisma.analysisRun.findUnique({
+      where: {
+        id: runId,
+      },
+    });
 
     if (!dbRun) {
-      throw new Error(
-        `Run ${runId} not found`,
-      );
+      throw new Error(`Run ${runId} not found`);
     }
 
-    const events =
-      await this.prisma.runEvent.findMany({
-        where: {
-          analysisRunId: runId,
-        },
-        orderBy: {
-          occurredAt: 'asc',
-        },
-      });
+    const events = await this.prisma.runEvent.findMany({
+      where: {
+        analysisRunId: runId,
+      },
+      orderBy: {
+        occurredAt: 'asc',
+      },
+    });
 
     return {
       runId,
@@ -683,21 +626,13 @@ if (
         status: event.status,
         stage: event.stage,
         progressPercent:
-          event.progressPercent === null
-            ? null
-            : Number(event.progressPercent),
-        safeMessage:
-          event.safeMessage,
-        errorCode:
-          event.errorCode,
-        retryable:
-          event.retryable,
-        correlationId:
-          event.correlationId,
-        details:
-          event.details,
-        occurredAt:
-          event.occurredAt.toISOString(),
+          event.progressPercent === null ? null : Number(event.progressPercent),
+        safeMessage: event.safeMessage,
+        errorCode: event.errorCode,
+        retryable: event.retryable,
+        correlationId: event.correlationId,
+        details: event.details,
+        occurredAt: event.occurredAt.toISOString(),
       })),
     };
   }
@@ -707,59 +642,42 @@ if (
   // =========================================
 
   async getRunArtifacts(runId: string) {
-    const dbRun =
-      await this.prisma.analysisRun.findUnique({
-        where: {
-          id: runId,
-        },
-      });
+    const dbRun = await this.prisma.analysisRun.findUnique({
+      where: {
+        id: runId,
+      },
+    });
 
     if (!dbRun) {
-      throw new Error(
-        `Run ${runId} not found`,
-      );
+      throw new Error(`Run ${runId} not found`);
     }
 
-    const artifacts =
-      await this.prisma.artifact.findMany({
-        where: {
-          analysisRunId: runId,
-        },
-        orderBy: {
-          createdAt: 'asc',
-        },
-      });
+    const artifacts = await this.prisma.artifact.findMany({
+      where: {
+        analysisRunId: runId,
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    });
 
     return {
       runId,
-      artifacts: artifacts.map(
-        (artifact) => ({
-          artifactId: artifact.id,
-          role: artifact.role,
-          logicalName:
-            artifact.logicalName,
-          artifactVersion:
-            artifact.artifactVersion,
-          uri:
-            artifact.uri,
-          mediaType:
-            artifact.mediaType,
-          checksumSha256:
-            artifact.checksumSha256,
-          sizeBytes:
-            artifact.sizeBytes === null
-              ? null
-              : artifact.sizeBytes.toString(),
-          timeStartUtc:
-            artifact.timeStartUtc?.toISOString(),
-          timeEndUtc:
-            artifact.timeEndUtc?.toISOString(),
-          metadata:
-            artifact.metadata,
-          createdAt:
-            artifact.createdAt.toISOString(),
-        }),
-      ),
+      artifacts: artifacts.map((artifact) => ({
+        artifactId: artifact.id,
+        role: artifact.role,
+        logicalName: artifact.logicalName,
+        artifactVersion: artifact.artifactVersion,
+        uri: artifact.uri,
+        mediaType: artifact.mediaType,
+        checksumSha256: artifact.checksumSha256,
+        sizeBytes:
+          artifact.sizeBytes === null ? null : artifact.sizeBytes.toString(),
+        timeStartUtc: artifact.timeStartUtc?.toISOString(),
+        timeEndUtc: artifact.timeEndUtc?.toISOString(),
+        metadata: artifact.metadata,
+        createdAt: artifact.createdAt.toISOString(),
+      })),
     };
   }
 
@@ -850,10 +768,20 @@ if (
               detectionRegionId: detection.id,
               regionNo: detection.regionNo,
               classification: detection.classification,
-              areaM2: detection.areaM2 === null ? null : detection.areaM2.toString(),
-              perimeterM: detection.perimeterM === null ? null : detection.perimeterM.toString(),
-              orientationDeg: detection.orientationDeg === null ? null : detection.orientationDeg.toString(),
-              meanLikelihood: detection.meanLikelihood === null ? null : detection.meanLikelihood.toString(),
+              areaM2:
+                detection.areaM2 === null ? null : detection.areaM2.toString(),
+              perimeterM:
+                detection.perimeterM === null
+                  ? null
+                  : detection.perimeterM.toString(),
+              orientationDeg:
+                detection.orientationDeg === null
+                  ? null
+                  : detection.orientationDeg.toString(),
+              meanLikelihood:
+                detection.meanLikelihood === null
+                  ? null
+                  : detection.meanLikelihood.toString(),
               properties: detection.properties,
             })),
             metricSets: phase1.metricSets.map((metricSet) => ({
@@ -877,13 +805,9 @@ if (
         mediaType: artifact.mediaType,
         checksumSha256: artifact.checksumSha256,
         sizeBytes:
-          artifact.sizeBytes === null
-            ? null
-            : artifact.sizeBytes.toString(),
-        timeStartUtc:
-          artifact.timeStartUtc?.toISOString() ?? null,
-        timeEndUtc:
-          artifact.timeEndUtc?.toISOString() ?? null,
+          artifact.sizeBytes === null ? null : artifact.sizeBytes.toString(),
+        timeStartUtc: artifact.timeStartUtc?.toISOString() ?? null,
+        timeEndUtc: artifact.timeEndUtc?.toISOString() ?? null,
         metadata: artifact.metadata,
         createdAt: artifact.createdAt.toISOString(),
       })),
@@ -930,39 +854,38 @@ if (
       throw new Error(`Run ${runId} not found`);
     }
 
-    const candidates =
-      await this.prisma.phase3Candidate.findMany({
-        where: {
-          analysisRunId: runId,
-        },
-        orderBy: {
-          createdAt: 'asc',
-        },
-        include: {
-          scores: {
-            orderBy: {
-              rank: 'asc',
-            },
-            include: {
-              components: {
-                orderBy: {
-                  componentName: 'asc',
-                },
+    const candidates = await this.prisma.phase3Candidate.findMany({
+      where: {
+        analysisRunId: runId,
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+      include: {
+        scores: {
+          orderBy: {
+            rank: 'asc',
+          },
+          include: {
+            components: {
+              orderBy: {
+                componentName: 'asc',
               },
             },
           },
-          features: {
-            orderBy: {
-              featureName: 'asc',
-            },
-          },
-          evidenceEvents: {
-            orderBy: {
-              eventTimeUtc: 'asc',
-            },
+        },
+        features: {
+          orderBy: {
+            featureName: 'asc',
           },
         },
-      });
+        evidenceEvents: {
+          orderBy: {
+            eventTimeUtc: 'asc',
+          },
+        },
+      },
+    });
 
     const result = candidates
       .map((candidate) => {
@@ -971,156 +894,117 @@ if (
         return {
           candidateId: candidate.id,
 
-          candidateSetVersion:
-            candidate.candidateSetVersion,
+          candidateSetVersion: candidate.candidateSetVersion,
 
-          publicMetadata: this.sanitizeAttributionMetadata(candidate.publicMetadata),
+          publicMetadata: this.sanitizeAttributionMetadata(
+            candidate.publicMetadata,
+          ),
 
           score: score
             ? {
-                scoreVersion:
-                  score.scoreVersion,
+                scoreVersion: score.scoreVersion,
 
-                investigativeScore:
-                  Number(score.investigativeScore),
+                investigativeScore: Number(score.investigativeScore),
 
-                rank:
-                  score.rank,
+                rank: score.rank,
 
                 // Prisma does not expose
                 // Unsupported("evidence_confidence").
-                confidence:
-                  null,
+                confidence: null,
 
-                positiveTotal:
-                  Number(score.positiveTotal),
+                positiveTotal: Number(score.positiveTotal),
 
-                negativeTotal:
-                  Number(score.negativeTotal),
+                negativeTotal: Number(score.negativeTotal),
 
                 confidenceCap:
                   score.confidenceCap === null
                     ? null
                     : Number(score.confidenceCap),
 
-                explanation:
-                  score.explanation,
+                explanation: score.explanation,
 
-                components:
-                  score.components.map(
-                    (component) => ({
-                      componentName:
-                        component.componentName,
+                components: score.components.map((component) => ({
+                  componentName: component.componentName,
 
-                      rawValue:
-                        component.rawValue === null
-                          ? null
-                          : Number(component.rawValue),
+                  rawValue:
+                    component.rawValue === null
+                      ? null
+                      : Number(component.rawValue),
 
-                      normalizedValue:
-                        component.normalizedValue === null
-                          ? null
-                          : Number(component.normalizedValue),
+                  normalizedValue:
+                    component.normalizedValue === null
+                      ? null
+                      : Number(component.normalizedValue),
 
-                      weight:
-                        Number(component.weight),
+                  weight: Number(component.weight),
 
-                      contribution:
-                        Number(component.contribution),
+                  contribution: Number(component.contribution),
 
-                      isDeduction:
-                        component.isDeduction,
+                  isDeduction: component.isDeduction,
 
-                      capApplied:
-                        component.capApplied === null
-                          ? null
-                          : Number(component.capApplied),
+                  capApplied:
+                    component.capApplied === null
+                      ? null
+                      : Number(component.capApplied),
 
-                      reason:
-                        component.reason,
-                    }),
-                  ),
+                  reason: component.reason,
+                })),
               }
             : null,
 
-          features:
-            candidate.features.map(
-              (feature) => ({
-                featureName:
-                  feature.featureName,
+          features: candidate.features.map((feature) => ({
+            featureName: feature.featureName,
 
-                featureVersion:
-                  feature.featureVersion,
+            featureVersion: feature.featureVersion,
 
-                rawValue:
-                  feature.rawValue === null
-                    ? null
-                    : Number(feature.rawValue),
+            rawValue:
+              feature.rawValue === null ? null : Number(feature.rawValue),
 
-                normalizedValue:
-                  feature.normalizedValue === null
-                    ? null
-                    : Number(feature.normalizedValue),
+            normalizedValue:
+              feature.normalizedValue === null
+                ? null
+                : Number(feature.normalizedValue),
 
-                unit:
-                  feature.unit,
+            unit: feature.unit,
 
-                availability:
-                  feature.availability,
+            availability: feature.availability,
 
-                confidenceCap:
-                  feature.confidenceCap === null
-                    ? null
-                    : Number(feature.confidenceCap),
+            confidenceCap:
+              feature.confidenceCap === null
+                ? null
+                : Number(feature.confidenceCap),
 
-                reason:
-                  feature.reason,
+            reason: feature.reason,
 
-                provenance:
-                  feature.provenance,
-              }),
-            ),
+            provenance: feature.provenance,
+          })),
 
-          evidence:
-            candidate.evidenceEvents.map(
-              (event) => ({
-                evidenceEventId:
-                  event.id,
+          evidence: candidate.evidenceEvents.map((event) => ({
+            evidenceEventId: event.id,
 
-                // Prisma does not expose
-                // Unsupported("evidence_kind").
-                kind:
-                  null,
+            // Prisma does not expose
+            // Unsupported("evidence_kind").
+            kind: null,
 
-                eventCode:
-                  event.eventCode,
+            eventCode: event.eventCode,
 
-                eventTimeUtc:
-                  event.eventTimeUtc?.toISOString() ?? null,
+            eventTimeUtc: event.eventTimeUtc?.toISOString() ?? null,
 
-                // Unsupported enum in Prisma.
-                confidence:
-                  null,
+            // Unsupported enum in Prisma.
+            confidence: null,
 
-                // DB model has explanation,
-                // not summary.
-                summary:
-                  event.explanation,
+            // DB model has explanation,
+            // not summary.
+            summary: event.explanation,
 
-                details:
-                  event.details,
-              }),
-            ),
+            details: event.details,
+          })),
         };
       })
       .sort((a, b) => {
-        const rankA =
-          a.score?.rank ??
-          Number.MAX_SAFE_INTEGER;
+        const rankA = a.score?.rank ?? Number.MAX_SAFE_INTEGER;
 
-        const rankB =
-          b.score?.rank ??
-          Number.MAX_SAFE_INTEGER;
+        const rankB = b.score?.rank ?? Number.MAX_SAFE_INTEGER;
 
         return rankA - rankB;
       });
@@ -1138,10 +1022,3 @@ if (
     };
   }
 }
-
-
-
-
-
-
-
