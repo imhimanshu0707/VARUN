@@ -680,6 +680,37 @@ class Phase2CompleteRunner:
                         },
                     )
                     write_netcdf_dataset(ds_forecast, forecast_file)
+
+                    ds_forecast.attrs.update(
+                        {
+                            "case_id": case_id,
+                            "phase2_run_id": self.run_id,
+                            "track_scope":
+                                "FUTURE_FORECAST_PARTICLES",
+                            "crs": "EPSG:4326",
+                            "coordinate_order":
+                                "[longitude, latitude]",
+                            "forecast_hours":
+                                forecast_hours,
+                        }
+                    )
+
+                    particle_tracks_file = (
+                        self.run_dir / "particle_tracks.nc"
+                    )
+
+                    write_netcdf_dataset(
+                        ds_forecast,
+                        particle_tracks_file,
+                    )
+
+                    all_artifacts.append(
+                        (
+                            "particle_tracks_netcdf",
+                            str(particle_tracks_file),
+                        )
+                    )
+
                     all_artifacts.append(("forecast", str(forecast_file)))
 
                     # Save forecast GeoJSON
@@ -693,10 +724,101 @@ class Phase2CompleteRunner:
                         json.dump(forecast_geojson, f)
                     all_artifacts.append(("forecast_geojson", str(forecast_geojson_file)))
 
+                    future_forecast_geojson = (
+                        create_trajectory_geojson(
+                            forecast_result.trajectory_lats,
+                            forecast_result.trajectory_lons,
+                            forecast_result.trajectory_times,
+                        )
+                    )
+
+                    for feature in future_forecast_geojson[
+                        "features"
+                    ]:
+                        feature["properties"].update(
+                            {
+                                "case_id": case_id,
+                                "phase2_run_id": self.run_id,
+                                "scenario": "future_forecast",
+                                "start_time_utc": to_iso_utc(
+                                    forecast_result.start_time
+                                ),
+                                "end_time_utc": to_iso_utc(
+                                    forecast_result.end_time
+                                ),
+                                "forecast_hours":
+                                    forecast_hours,
+                            }
+                        )
+
+                    future_forecast_file = (
+                        self.run_dir
+                        / "future_forecast.geojson"
+                    )
+
+                    with future_forecast_file.open(
+                        "w",
+                        encoding="utf-8",
+                    ) as file:
+                        json.dump(
+                            future_forecast_geojson,
+                            file,
+                            indent=2,
+                        )
+
+                    all_artifacts.append(
+                        (
+                            "future_forecast_geojson",
+                            str(future_forecast_file),
+                        )
+                    )
+
                     validation_checks["forecast"] = {"status": "PASS"}
                 else:
                     logger.warning("Forecast failed")
                     validation_checks["forecast"] = {"status": "FAIL"}
+
+                shoreline_risk = {
+                "type": "FeatureCollection",
+                "properties": {
+                    "case_id": case_id,
+                    "phase2_run_id": self.run_id,
+                    "assessment_status": "NOT_AVAILABLE",
+                    "reason": (
+                        "No coastline geometry is configured "
+                        "for this simulation run."
+                    ),
+                    "crs": "EPSG:4326",
+                },
+                "features": [],
+            }
+
+            shoreline_risk_file = (
+                self.run_dir / "shoreline_risk.geojson"
+            )
+
+            with shoreline_risk_file.open(
+                "w",
+                encoding="utf-8",
+            ) as file:
+                json.dump(
+                    shoreline_risk,
+                    file,
+                    indent=2,
+                )
+
+            all_artifacts.append(
+                (
+                    "shoreline_risk_geojson",
+                    str(shoreline_risk_file),
+                )
+            )
+
+            validation_checks["shoreline_risk"] = {
+                "status": "PASS",
+                "assessment_status": "NOT_AVAILABLE",
+                "reason": "COASTLINE_DATA_NOT_CONFIGURED",
+            }
 
             # ========== Step 9: Generate Phase 3 Search Window ==========
             logger.info(f"[9/9] Generating Phase 3 search window...")
@@ -834,6 +956,137 @@ class Phase2CompleteRunner:
 
             validation_checks["search_window"] = {"status": "PASS"}
             logger.info("✓ Phase 3 search window generated")
+
+            layer_definitions = [
+                {
+                    "layer_id": "backward_tracks",
+                    "title": "Backward Particle Tracks",
+                    "logical_name": "backward_tracks.geojson",
+                    "format": "GeoJSON",
+                    "geometry_type": "LineString",
+                    "dashboard_role": "HINDCAST_TRACKS",
+                    "default_visible": False,
+                },
+                {
+                    "layer_id": "origin_50",
+                    "title": "Probable Origin 50%",
+                    "logical_name": "origin_50.geojson",
+                    "format": "GeoJSON",
+                    "geometry_type": "Polygon",
+                    "dashboard_role": "ORIGIN_REGION",
+                    "default_visible": True,
+                },
+                {
+                    "layer_id": "origin_75",
+                    "title": "Probable Origin 75%",
+                    "logical_name": "origin_75.geojson",
+                    "format": "GeoJSON",
+                    "geometry_type": "Polygon",
+                    "dashboard_role": "ORIGIN_REGION",
+                    "default_visible": True,
+                },
+                {
+                    "layer_id": "origin_90",
+                    "title": "Probable Origin 90%",
+                    "logical_name": "origin_90.geojson",
+                    "format": "GeoJSON",
+                    "geometry_type": "Polygon",
+                    "dashboard_role": "ORIGIN_REGION",
+                    "default_visible": False,
+                },
+                {
+                    "layer_id": "forward_reconstruction",
+                    "title": "Forward Reconstruction",
+                    "logical_name": (
+                        "forward_reconstruction.geojson"
+                    ),
+                    "format": "GeoJSON",
+                    "geometry_type": "FeatureCollection",
+                    "dashboard_role": "RECONSTRUCTION",
+                    "default_visible": True,
+                },
+                {
+                    "layer_id": "future_forecast",
+                    "title": "Future Forecast",
+                    "logical_name": "future_forecast.geojson",
+                    "format": "GeoJSON",
+                    "geometry_type": "LineString",
+                    "dashboard_role": "FORECAST_TRACKS",
+                    "default_visible": True,
+                },
+                {
+                    "layer_id": "shoreline_risk",
+                    "title": "Shoreline Risk",
+                    "logical_name": "shoreline_risk.geojson",
+                    "format": "GeoJSON",
+                    "geometry_type": "FeatureCollection",
+                    "dashboard_role": "SHORELINE_RISK",
+                    "default_visible": True,
+                },
+                {
+                    "layer_id": "particle_tracks",
+                    "title": "Particle Track Dataset",
+                    "logical_name": "particle_tracks.nc",
+                    "format": "NetCDF",
+                    "geometry_type": None,
+                    "dashboard_role": "SCIENTIFIC_DOWNLOAD",
+                    "default_visible": False,
+                },
+            ]
+
+            for layer in layer_definitions:
+                layer_path = (
+                    self.run_dir
+                    / layer["logical_name"]
+                )
+                layer["available"] = (
+                    layer_path.is_file()
+                )
+
+            layer_manifest = {
+                "contract_version": (
+                    "phase2-dashboard-layers-v1"
+                ),
+                "case_id": case_id,
+                "phase2_run_id": self.run_id,
+                "crs": "EPSG:4326",
+                "coordinate_order": (
+                    "[longitude, latitude]"
+                ),
+                "layers": layer_definitions,
+            }
+
+            layer_manifest_file = (
+                self.run_dir / "layer_manifest.json"
+            )
+
+            with layer_manifest_file.open(
+                "w",
+                encoding="utf-8",
+            ) as file:
+                json.dump(
+                    layer_manifest,
+                    file,
+                    indent=2,
+                )
+
+            all_artifacts.append(
+                (
+                    "layer_manifest",
+                    str(layer_manifest_file),
+                )
+            )
+
+            validation_checks["layer_manifest"] = {
+                "status": "PASS",
+                "layer_count": len(
+                    layer_definitions
+                ),
+                "available_layer_count": sum(
+                    bool(layer["available"])
+                    for layer in layer_definitions
+                ),
+            }
 
             # ========== Generate Validation Report ==========
             validation_report = {

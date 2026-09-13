@@ -56,6 +56,27 @@ class DriftSimulationEngine:
             oil.add_reader(reader)
             logger.info("Added reader: %s", reader)
 
+        reader_has_landmask = any(
+            "land_binary_mask"
+            in getattr(
+                reader,
+                "variables",
+                [],
+            )
+            for reader in readers
+        )
+
+        if reader_has_landmask:
+            oil.set_config(
+                "general:use_auto_landmask",
+                False,
+            )
+            logger.info(
+                "Using land_binary_mask from forcing "
+                "reader; automatic GSHHG landmask "
+                "disabled."
+            )
+
         try:
             oil.set_config(
                 "environment:fallback:x_wind",

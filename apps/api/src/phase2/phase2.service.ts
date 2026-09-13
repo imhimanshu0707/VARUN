@@ -597,6 +597,7 @@ export class Phase2Service {
        * files locally. We only accept simple logical names and never
        * allow arbitrary absolute paths from the engine response.
        */
+
       const root =
         path.resolve(process.cwd());
 
@@ -605,6 +606,63 @@ export class Phase2Service {
           root,
           'artifacts',
         );
+
+      const runArtifactRoot =
+        path.resolve(
+          artifactRoot,
+          job.runId,
+        );
+
+      if (
+        !runArtifactRoot.startsWith(
+          `${artifactRoot}${path.sep}`,
+        )
+      ) {
+        throw new Error(
+          'PHASE2_ARTIFACT_TARGET_INVALID',
+        );
+      }
+
+      const engineOutputRootValue =
+        process.env
+          .PHASE2_ENGINE_OUTPUT_ROOT;
+
+      if (!engineOutputRootValue) {
+        throw new Error(
+          'PHASE2_ENGINE_OUTPUT_ROOT_MISSING',
+        );
+      }
+
+      const engineOutputRoot =
+        path.resolve(
+          engineOutputRootValue,
+        );
+
+      const engineRunRoot =
+        path.resolve(
+          engineOutputRoot,
+          job.runId,
+        );
+
+      if (
+        !engineRunRoot.startsWith(
+          `${engineOutputRoot}${path.sep}`,
+        )
+      ) {
+        throw new Error(
+          'PHASE2_ARTIFACT_SOURCE_INVALID',
+        );
+      }
+
+      const fileSystem =
+        await import('fs/promises');
+
+      await fileSystem.mkdir(
+        runArtifactRoot,
+        {
+          recursive: true,
+        },
+      );
 
       for (
         const artifact
@@ -625,34 +683,89 @@ export class Phase2Service {
           continue;
         }
 
+                const sourceUri =
+          typeof artifact.uri ===
+          'string'
+            ? artifact.uri
+            : null;
+
+        if (!sourceUri) {
+          throw new Error(
+            'PHASE2_ARTIFACT_URI_MISSING',
+          );
+        }
+
+        const sourcePath =
+          path.resolve(
+            sourceUri.replace(
+              /^file:\/\//,
+              '',
+            ),
+          );
+
+        if (
+          sourcePath === engineRunRoot ||
+          !sourcePath.startsWith(
+            `${engineRunRoot}${path.sep}`,
+          )
+        ) {
+          throw new Error(
+            'PHASE2_ARTIFACT_SOURCE_INVALID',
+          );
+        }
+
         const candidatePath =
           path.resolve(
-            artifactRoot,
+            runArtifactRoot,
             logicalName,
           );
 
         if (
-          candidatePath !==
-            artifactRoot &&
+          candidatePath ===
+            runArtifactRoot ||
           !candidatePath.startsWith(
-            `${artifactRoot}${path.sep}`,
+            `${runArtifactRoot}${path.sep}`,
           )
         ) {
-          continue;
+          throw new Error(
+            'PHASE2_ARTIFACT_TARGET_INVALID',
+          );
         }
 
-        let stat:
-          import('fs').Stats | null =
-          null;
+        await fileSystem.copyFile(
+          sourcePath,
+          candidatePath,
+        );
 
-        try {
-          stat =
-            await (
-              await import('fs/promises')
-            ).stat(candidatePath);
-        } catch {
-          stat = null;
+        const copiedBytes =
+          await fileSystem.readFile(
+            candidatePath,
+          );
+
+        const copiedChecksum =
+          createHash('sha256')
+            .update(copiedBytes)
+            .digest('hex');
+
+        if (
+          typeof artifact.checksumSha256 ===
+            'string' &&
+          copiedChecksum !==
+            artifact.checksumSha256
+        ) {
+          await fileSystem.unlink(
+            candidatePath,
+          );
+
+          throw new Error(
+            'PHASE2_ARTIFACT_CHECKSUM_MISMATCH',
+          );
         }
+
+        const stat =
+          await fileSystem.stat(
+            candidatePath,
+          );
 
         await this.prisma.$executeRawUnsafe(
           `INSERT INTO artifacts
@@ -700,7 +813,7 @@ export class Phase2Service {
                 EXCLUDED.metadata`,
           job.runId,
           logicalName,
-          `artifacts/${logicalName}`,
+          `artifacts/${job.runId}/${logicalName}`,
           typeof artifact.mediaType ===
             'string'
             ? artifact.mediaType

@@ -29,6 +29,33 @@ export class ArtifactsController {
     return result;
   }
 
+    @Get(
+    'runs/:runId/artifacts/:logicalName',
+  )
+  async serveRunArtifact(
+    @Param('runId') runId: string,
+    @Param('logicalName')
+    logicalName: string,
+    @Res() response: Response,
+  ) {
+    const file =
+      await this.artifactsService
+        .resolveRunArtifact(
+          runId,
+          logicalName,
+        );
+
+    response.setHeader(
+      'Content-Type',
+      file.mediaType,
+    );
+    response.setHeader(
+      'Cache-Control',
+      'no-store',
+    );
+    response.send(file.bytes);
+  }
+
   @Get('artifacts/by-run/:logicalName')
   async serveLatestRunArtifact(
     @Param('logicalName') logicalName: string,

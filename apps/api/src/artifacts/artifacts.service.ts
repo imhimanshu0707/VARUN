@@ -67,12 +67,49 @@ export class ArtifactsService {
     return resolved;
   }
 
-  private mediaType(logicalName: string, fallback: string) {
-    const lower = logicalName.toLowerCase();
-    if (lower.endsWith('.geojson')) return 'application/geo+json';
-    if (lower.endsWith('.json')) return 'application/json';
-    if (lower.endsWith('.csv')) return 'text/csv';
-    return ['application/geo+json', 'application/json', 'text/csv'].includes(fallback)
+    private mediaType(
+    logicalName: string,
+    fallback: string,
+  ) {
+    const lower =
+      logicalName.toLowerCase();
+
+    if (lower.endsWith('.geojson')) {
+      return 'application/geo+json';
+    }
+
+    if (lower.endsWith('.json')) {
+      return 'application/json';
+    }
+
+    if (lower.endsWith('.csv')) {
+      return 'text/csv';
+    }
+
+    if (lower.endsWith('.nc')) {
+      return 'application/x-netcdf';
+    }
+
+    if (lower.endsWith('.png')) {
+      return 'image/png';
+    }
+
+    if (lower.endsWith('.mp4')) {
+      return 'video/mp4';
+    }
+
+    const allowedFallbacks = [
+      'application/geo+json',
+      'application/json',
+      'application/x-netcdf',
+      'text/csv',
+      'image/png',
+      'video/mp4',
+    ];
+
+    return allowedFallbacks.includes(
+      fallback,
+    )
       ? fallback
       : 'application/octet-stream';
   }
@@ -118,6 +155,56 @@ export class ArtifactsService {
         },
       });
     }
+  }
+
+    async resolveRunArtifact(
+    runId: string,
+    logicalName: string,
+  ) {
+    if (
+      !runId ||
+      !logicalName ||
+      logicalName.includes('..') ||
+      path.isAbsolute(logicalName) ||
+      !/^[A-Za-z0-9._-]+$/.test(
+        logicalName,
+      )
+    ) {
+      throw new NotFoundException({
+        error: {
+          code: 'ARTIFACT_NOT_FOUND',
+          message:
+            'Artifact is not available.',
+          retryable: false,
+        },
+      });
+    }
+
+    const artifact =
+      await this.prisma.artifact.findFirst({
+        where: {
+          analysisRunId: runId,
+          logicalName,
+        },
+        orderBy: {
+          createdAt: 'desc',
+        },
+      });
+
+    if (!artifact) {
+      throw new NotFoundException({
+        error: {
+          code: 'ARTIFACT_NOT_FOUND',
+          message:
+            'Artifact is not available.',
+          retryable: false,
+        },
+      });
+    }
+
+    return this.resolveArtifact(
+      artifact.id,
+    );
   }
 
   async resolveLatestPhase3Artifact(logicalName: string) {
